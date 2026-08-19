@@ -492,20 +492,30 @@ with tab_draft:
                         lambda v: "" if pd.isna(v) else f"{v:.0f}%")
                 st.dataframe(display, use_container_width=True, hide_index=True)
 
-            st.markdown("**Draft a player** (assigns to the team on the clock):")
-            pick_pool = state.available(players).sort_values("adp").head(50)
+            st.markdown("**Draft a player** — defaults to the top pick; "
+                        "type to search, Enter to select, then Record. "
+                        "Applies to the team on the clock.")
+            avail_df = state.available(players).copy()
+            # order the list by the recommendation ranking so the #1 pick is the
+            # default; gated/late players fall to the end but stay searchable.
+            order_index = {str(pid): i for i, pid in enumerate(board["player_id"].tolist())}
+            avail_df["_ord"] = avail_df["player_id"].astype(str).map(
+                lambda p: order_index.get(p, 10 ** 9))
+            pick_pool = avail_df.sort_values(["_ord", "adp"])
             options = {
                 f"{r['name']} ({r['pos']}, {r['team']}) — ADP {r['adp']:.0f}": r["player_id"]
                 for _, r in pick_pool.iterrows()
             }
-            chosen = st.selectbox("Player", list(options.keys()), key="pick_select")
-            b1, b2 = st.columns(2)
-            if b1.button("Record pick", type="primary"):
+            opt_labels = list(options.keys())
+            with st.form("draft_form"):
+                chosen = st.selectbox("Player", opt_labels, index=0)
+                submitted = st.form_submit_button("Record pick", type="primary")
+            if submitted and chosen:
                 pid = options[chosen]
                 row = players.loc[players["player_id"] == pid].iloc[0].to_dict()
                 state.record_pick(row)
                 st.rerun()
-            if b2.button("Undo last pick"):
+            if st.button("Undo last pick"):
                 state.undo()
                 st.rerun()
 
