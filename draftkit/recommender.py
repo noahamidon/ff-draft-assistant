@@ -21,7 +21,7 @@ import pandas as pd
 
 from .config import LeagueConfig
 from .draft_state import DraftState
-from .valuation import add_vona, add_vorp
+from .valuation import add_vona, add_vorp, optimal_lineup_value
 
 
 def assign_tiers(players: pd.DataFrame, gap_mult: float = 1.0) -> pd.DataFrame:
@@ -86,6 +86,58 @@ def positional_need(state: DraftState, config: LeagueConfig) -> Dict[str, float]
     return out
 
 
+def suppressed_positions(state: DraftState, config: LeagueConfig) -> set:
+    """Positions that should NOT be recommended/simulated yet.
+
+    K / DST / IDP are near-streamable, so they're deferred until you're within a
+    few rounds of the end AND still short a starter. Positions your league
+    doesn't start at all are always suppressed.
+    """
+    import math
+    counts = defaultdict(int)
+    for p in state.my_roster():
+        counts[p.pos] += 1
+    picks_left = state.total_picks - state.next_overall + 1
+    rounds_left = math.ceil(picks_left / max(1, config.team_count))
+    within = {"K": 2, "DST": 2, "IDP": 5}
+    supp = set()
+    for pos in ("K", "DST", "IDP"):
+        req = config.starters.get(pos, 0)
+        if req == 0:
+            supp.add(pos)
+            continue
+        still_need = counts.get(pos, 0) < req
+        if not (still_need and rounds_left <= within[pos]):
+            supp.add(pos)
+    return supp
+
+
+def candidate_pool(
+    state: DraftState, players: pd.DataFrame, config: LeagueConfig, n: int
+) -> pd.DataFrame:
+    """Candidates to simulate: the best available by value, EXCLUDING deferred
+    positions, and guaranteeing the best option at each unmet-need position is
+    included (so e.g. WR is considered when you still need WRs)."""
+    supp = suppressed_positions(state, config)
+    av = add_vorp(state.available(players), config)
+    av = av[~av["pos"].isin(supp)]
+    if av.empty:
+        return av
+    cand = av.sort_values("vorp", ascending=False).head(n)
+
+    counts = defaultdict(int)
+    for p in state.my_roster():
+        counts[p.pos] += 1
+    flex_elig = set().union(*[e for _, e in config.flex_slots]) if config.flex_slots else set()
+    for pos, req in config.starters.items():
+        if pos in supp or req == 0:
+            continue
+        if counts.get(pos, 0) < req or pos in flex_elig:
+            best = av[av["pos"] == pos].sort_values("vorp", ascending=False).head(1)
+            cand = pd.concat([cand, best])
+    return cand.drop_duplicates("player_id").reset_index(drop=True)
+
+
 def build_board(
     state: DraftState,
     players: pd.DataFrame,
@@ -105,62 +157,53 @@ def build_board(
     need = positional_need(state, config)
     avail["need"] = avail["pos"].map(need).fillna(0.0)
 
-    # Drop positions your league doesn't start (e.g. D/ST when you run IDP).
-    unused = [p for p in ("DST", "K", "IDP") if config.starters.get(p, 0) == 0]
-    if unused:
-        avail = avail[~avail["pos"].isin(unused)]
+    # Drop positions your league doesn't start, and defer K/DST/IDP.
+    supp = suppressed_positions(state, config)
+    if supp:
+        avail = avail[~avail["pos"].isin(supp)]
+    if avail.empty:
+        avail["sim_ev"] = []
+        return avail
 
-    # blended fallback score (used when no sim). Normalize vorp/vona to compare.
+    # marginal starting-lineup value: how much this player improves YOUR
+    # optimal starting lineup right now. A 3rd RB when your RB slots are full
+    # adds ~0; a WR when you have none adds a lot. This is what makes the board
+    # roster-aware instead of just ranking abstract value.
+    proj_lookup = dict(zip(players["player_id"].astype(str), players["proj"].astype(float)))
+    my_rows = [{"pos": p.pos, "proj": proj_lookup.get(str(p.player_id), 0.0)}
+               for p in state.my_roster()]
+    base_val = optimal_lineup_value(my_rows, config)
+    avail["marginal"] = [
+        optimal_lineup_value(my_rows + [{"pos": pos, "proj": pr}], config) - base_val
+        for pos, pr in zip(avail["pos"], avail["proj"])
+    ]
+
     def _z(s: pd.Series) -> pd.Series:
         sd = s.std()
         return (s - s.mean()) / sd if sd > 1e-9 else s * 0.0
 
     avail["blended"] = (
-        _z(avail["vorp"]) * 1.0
-        + _z(avail["vona"]) * 0.6
-        + avail["need"] * 1.2
+        _z(avail["marginal"]) * 1.3
+        + _z(avail["vorp"]) * 0.7
+        + _z(avail["vona"]) * 0.4
+        + avail["need"] * 0.5
     )
-
-    # -- late-round gate ----------------------------------------------------
-    # K / DST / IDP are near-streamable and tightly bunched, so drafting them
-    # early is wasteful. Suppress them until you're within a few rounds of the
-    # end AND still short a starter there; otherwise sink them to the bottom.
-    import math as _math
-    my_counts = defaultdict(int)
-    for p in state.my_roster():
-        my_counts[p.pos] += 1
-    picks_left = state.total_picks - state.next_overall + 1
-    rounds_left = _math.ceil(picks_left / max(1, config.team_count))
-    LATE_WITHIN = {"K": 2, "DST": 2, "IDP": 5}
-
-    def _penalty(row) -> float:
-        pos = row["pos"]
-        within = LATE_WITHIN.get(pos)
-        if within is None:
-            return 0.0
-        still_need = my_counts.get(pos, 0) < config.starters.get(pos, 0)
-        if still_need and rounds_left <= within:
-            return 0.0                      # OK to consider now
-        return 1e6                          # otherwise bury it
-
-    avail["_penalty"] = avail.apply(_penalty, axis=1)
 
     if sim_results is not None and not sim_results.empty:
         sim_map = sim_results.set_index("player_id")["mean_value"].to_dict()
         std_map = sim_results.set_index("player_id")["std_value"].to_dict()
         avail["sim_ev"] = avail["player_id"].astype(str).map(sim_map)
         avail["sim_std"] = avail["player_id"].astype(str).map(std_map)
-        avail["_rank_key"] = avail["sim_ev"].fillna(-1e18) - avail["_penalty"]
+        avail["_rank_key"] = avail["sim_ev"].fillna(-1e18)
         avail = avail.sort_values(
             ["_rank_key", "blended"], ascending=[False, False]
         ).drop(columns="_rank_key")
     else:
         avail["sim_ev"] = np.nan
         avail["sim_std"] = np.nan
-        avail["_score"] = avail["blended"] - avail["_penalty"]
-        avail = avail.sort_values("_score", ascending=False).drop(columns="_score")
+        avail = avail.sort_values("blended", ascending=False)
 
-    return avail.drop(columns="_penalty").reset_index(drop=True)
+    return avail.reset_index(drop=True)
 
 
 def reason_for(row: pd.Series, config: LeagueConfig) -> str:

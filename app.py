@@ -293,16 +293,21 @@ state.my_team = int(my_seat)
 # --------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def cached_sim(sig: str, _state, _players, _cfg, n_sims: int, n_cands: int):
-    cands = _state.available(_players).sort_values("adp").head(n_cands)
+    from draftkit.recommender import candidate_pool
+    cands = candidate_pool(_state, _players, _cfg, n_cands)
+    if cands.empty:
+        return cands
     return simulate_candidates(
         _state, _players, _cfg, candidates=cands,
-        n_sims=n_sims, max_candidates=n_cands, seed=1,
+        n_sims=n_sims, max_candidates=len(cands), seed=1,
     )
 
 
 def sim_signature() -> str:
+    from draftkit.recommender import suppressed_positions
     drafted = ",".join(sorted(state.drafted_ids))
-    return f"{drafted}|{state.my_team}|{n_sims}|{n_cands}|{len(players)}|{round(float(players['proj'].sum()),1)}"
+    supp = ",".join(sorted(suppressed_positions(state, cfg)))
+    return f"{drafted}|{state.my_team}|{n_sims}|{n_cands}|{len(players)}|{round(float(players['proj'].sum()),1)}|{supp}"
 
 # --------------------------------------------------------------------------
 # Hero + tabs
