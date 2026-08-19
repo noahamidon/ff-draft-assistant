@@ -56,6 +56,35 @@ def pick_probabilities(sim_df: pd.DataFrame, n_samples: int = 20000, seed: int =
     return {str(pid): float(p) for pid, p in zip(sim_df["player_id"], probs)}
 
 
+def _model_opponent_idx(board, counts, ctx, rng, temp: float = 0.15, pool: int = 25) -> int:
+    """Index of the pick a team would make IF USING THIS MODEL: the highest
+    roster-aware value (VORP x positional need), with softmax noise so it's a
+    realistic distribution rather than deterministic. This is what powers the
+    'chance they survive to me' odds — it assumes rivals draft like you do.
+    """
+    n = len(board)
+    if n == 0:
+        return -1
+    k = min(pool, n)
+    scores = [
+        board[i].get("vorp", board[i]["proj"]) * _need_mult(ctx, counts, board[i]["pos"])
+        for i in range(k)
+    ]
+    m = max(scores)
+    t = max(abs(m) * temp, 1e-6)
+    weights = [math.exp((s - m) / t) for s in scores]
+    tot = sum(weights)
+    if tot <= 0:
+        return 0
+    r = rng.random() * tot
+    cum = 0.0
+    for i in range(k):
+        cum += weights[i]
+        if r <= cum:
+            return i
+    return k - 1
+
+
 def availability_until(
     state: DraftState,
     players: pd.DataFrame,
@@ -63,15 +92,13 @@ def availability_until(
     until_overall: int,
     target_ids: list,
     n_sims: int = 300,
-    opp_temp: float = 5.0,
-    opp_pool: int = 12,
     seed: int = 0,
 ) -> dict:
-    """P(each target player is still available at `until_overall`).
+    """P(each target is still available at `until_overall`), assuming every team
+    in front of you drafts using THIS model (roster-aware value + noise).
 
-    Simulates only the opponent picks between now and your next pick (fast),
-    using the same need-aware opponent model, and counts how often each target
-    survives. If it's already your turn, everyone is available (1.0).
+    Simulates only the picks between now and your next pick (fast). If it's
+    already your turn, everyone is available (1.0).
     """
     from collections import Counter
 
@@ -84,7 +111,7 @@ def availability_until(
     rng = np.random.default_rng(seed)
     avail = add_vorp(state.available(players), config).sort_values("adp").reset_index(drop=True)
     span = until_overall - state.next_overall
-    cap = min(len(avail), max(60, span + 40))
+    cap = min(len(avail), max(80, span + 60))
     base_board = _rows_to_records(avail.head(cap))
     need_ctx = _make_need_ctx(config)
 
@@ -100,7 +127,7 @@ def availability_until(
         while overall < until_overall and board:
             team = state.team_on_clock(overall)
             if team != state.my_team:
-                idx = _opponent_pick(board, overall, counts[team], need_ctx, rng, opp_temp, opp_pool)
+                idx = _model_opponent_idx(board, counts[team], need_ctx, rng)
                 if idx >= 0:
                     counts[team][board.pop(idx)["pos"]] += 1
             overall += 1

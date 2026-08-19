@@ -537,47 +537,53 @@ with tab_draft:
                 st.rerun()
 
     with right:
-        section("Your pick — quick view")
-        # On your turn, mirror the exact confidence-ranked board from the main
-        # panel (same calculation, just condensed). Otherwise show your own
-        # roster-aware board with survival odds to your next pick.
-        if my_turn:
-            my_board = board
-        else:
-            my_board = build_board(state, players, cfg, team=state.my_team)
-        my_next = state.my_next_pick() or state.next_overall
+        # Your recommendation, always from your roster's view. On your turn the
+        # look-ahead target is your NEXT pick; otherwise it's your upcoming pick.
+        my_board = board if my_turn else build_board(state, players, cfg, team=state.my_team)
+        look_pick = state.my_pick_after_next() if my_turn else (state.my_next_pick() or state.next_overall)
+
+        section("Around at your next pick?" if my_turn else "Your pick — quick view")
         if my_board.empty:
             st.caption("Nothing to suggest.")
+        elif my_turn and look_pick is None:
+            st.caption("This is your last pick — no next pick to look ahead to.")
         else:
-            targets = my_board.head(5).copy()
             from draftkit.simulation import availability_until
+            cand = my_board.head(10).copy().reset_index(drop=True)
             avail_map = availability_until(
-                state, players, cfg, my_next, targets["player_id"].tolist(), n_sims=250,
+                state, players, cfg, look_pick, cand["player_id"].tolist(), n_sims=250,
             )
-            targets["avail"] = targets["player_id"].astype(str).map(avail_map).fillna(1.0) * 100
+            cand["avail"] = cand["player_id"].astype(str).map(avail_map).fillna(1.0) * 100
+
+            # fold availability into the ordering: a mild urgency boost so a
+            # scarce, high-value target edges above one that'll come back.
+            n = max(1, len(cand) - 1)
+            cand["_value_rank"] = 1 - cand.index / n
+            cand["priority"] = cand["_value_rank"] + 0.35 * (1 - cand["avail"] / 100)
+            cand = cand.sort_values("priority", ascending=False).head(5).reset_index(drop=True)
 
             if my_turn:
-                st.caption("It's your pick — these are available now.")
+                st.caption(f"Draft now (main panel), but here's how likely each "
+                           f"is to fall back to your next pick (#{look_pick}). "
+                           f"Grab the ones that won't.")
             else:
-                st.caption(f"Your next pick is overall #{my_next} "
+                st.caption(f"Your next pick is #{look_pick} "
                            f"({state.picks_until_my_turn()} away). "
-                           f"“Avail” = chance the player is still there.")
+                           f"“Avail” = chance they're still there, if rivals draft like this model.")
 
-            # highlight your #1 target
-            t0 = targets.iloc[0]
-            avail_txt = "" if my_turn else f" · {float(t0['avail']):.0f}% avail"
+            t0 = cand.iloc[0]
             st.markdown(
                 f"<div style='padding:10px 14px;border-left:4px solid #943c3c;"
                 f"background:#f2ede6;border-radius:6px;margin-bottom:8px;'>"
                 f"<span style='font-size:0.65rem;letter-spacing:2px;text-transform:"
-                f"uppercase;color:#888;'>Your best pick</span><br>"
+                f"uppercase;color:#888;'>{'Grab now' if float(t0['avail'])<55 else 'Top target'}</span><br>"
                 f"<span style='font-size:1.1rem;font-weight:700;color:#943c3c;'>"
-                f"{t0['name']}</span> <span style='color:#555;'>({t0['pos']})"
-                f"{avail_txt}</span></div>",
+                f"{t0['name']}</span> <span style='color:#555;'>({t0['pos']}) · "
+                f"{float(t0['avail']):.0f}% avail next</span></div>",
                 unsafe_allow_html=True,
             )
 
-            mini = targets[["name", "pos", "avail"]].copy()
+            mini = cand[["name", "pos", "avail"]].copy()
             try:
                 msty = mini.style.map(
                     lambda v: f"color:{_POS_COLORS.get(v, '#2c2c2c')};font-weight:600",
