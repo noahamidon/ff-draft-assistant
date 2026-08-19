@@ -1,0 +1,30 @@
+# Fallback / override league config, used only if data/raw_settings.json is
+# absent (i.e. before you run the ESPN connection test). Once we pull your real
+# settings from ESPN, this file is ignored -- but you can edit it to force a
+# specific config for testing.
+
+name: "Sample 12-team PPR"
+team_count: 12
+
+# dedicated starting slots
+starters:
+  QB: 1
+  RB: 2
+  WR: 2
+  TE: 1
+  K: 1
+  DST: 1
+
+# flex slots: each has a count and a set of eligible positions
+flex_slots:
+  - count: 1
+    eligible: ["RB", "WR", "TE"]
+
+bench: 6
+
+# scoring knobs the model actually uses (points per event)
+scoring:
+  receptions: 1.0     # 1.0 = full PPR, 0.5 = half, 0.0 = standard
+  pass_td: 4.0
+
+superflex: false
