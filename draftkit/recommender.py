@@ -50,15 +50,16 @@ def assign_tiers(players: pd.DataFrame, gap_mult: float = 1.0) -> pd.DataFrame:
     return out
 
 
-def positional_need(state: DraftState, config: LeagueConfig) -> Dict[str, float]:
-    """0..1 need score per position: unmet starting demand for YOUR roster.
+def positional_need(state: DraftState, config: LeagueConfig, team: Optional[int] = None) -> Dict[str, float]:
+    """0..1 need score per position: unmet starting demand for a team's roster.
 
     K / DST / IDP are deliberately excluded (returned 0): they should never
     create early-round urgency. When to actually draft them is handled by the
-    late-round gate in build_board, not by a need spike.
+    late-round gate, not by a need spike.
     """
+    team = team if team is not None else state.my_team
     counts = defaultdict(int)
-    for p in state.my_roster():
+    for p in state.roster_of(team):
         counts[p.pos] += 1
 
     LATE = {"K", "DST", "IDP"}
@@ -86,16 +87,17 @@ def positional_need(state: DraftState, config: LeagueConfig) -> Dict[str, float]
     return out
 
 
-def suppressed_positions(state: DraftState, config: LeagueConfig) -> set:
-    """Positions that should NOT be recommended/simulated yet.
+def suppressed_positions(state: DraftState, config: LeagueConfig, team: Optional[int] = None) -> set:
+    """Positions that should NOT be recommended/simulated yet for a team.
 
-    K / DST / IDP are near-streamable, so they're deferred until you're within a
-    few rounds of the end AND still short a starter. Positions your league
-    doesn't start at all are always suppressed.
+    K / DST / IDP are near-streamable, so they're deferred until within a few
+    rounds of the end AND still short a starter. Positions the league doesn't
+    start at all are always suppressed.
     """
     import math
+    team = team if team is not None else state.my_team
     counts = defaultdict(int)
-    for p in state.my_roster():
+    for p in state.roster_of(team):
         counts[p.pos] += 1
     picks_left = state.total_picks - state.next_overall + 1
     rounds_left = math.ceil(picks_left / max(1, config.team_count))
@@ -113,12 +115,14 @@ def suppressed_positions(state: DraftState, config: LeagueConfig) -> set:
 
 
 def candidate_pool(
-    state: DraftState, players: pd.DataFrame, config: LeagueConfig, n: int
+    state: DraftState, players: pd.DataFrame, config: LeagueConfig, n: int,
+    team: Optional[int] = None,
 ) -> pd.DataFrame:
     """Candidates to simulate: the best available by value, EXCLUDING deferred
     positions, and guaranteeing the best option at each unmet-need position is
     included (so e.g. WR is considered when you still need WRs)."""
-    supp = suppressed_positions(state, config)
+    team = team if team is not None else state.my_team
+    supp = suppressed_positions(state, config, team)
     av = add_vorp(state.available(players), config)
     av = av[~av["pos"].isin(supp)]
     if av.empty:
@@ -126,7 +130,7 @@ def candidate_pool(
     cand = av.sort_values("vorp", ascending=False).head(n)
 
     counts = defaultdict(int)
-    for p in state.my_roster():
+    for p in state.roster_of(team):
         counts[p.pos] += 1
     flex_elig = set().union(*[e for _, e in config.flex_slots]) if config.flex_slots else set()
     for pos, req in config.starters.items():
@@ -143,35 +147,36 @@ def build_board(
     players: pd.DataFrame,
     config: LeagueConfig,
     sim_results: Optional[pd.DataFrame] = None,
+    team: Optional[int] = None,
 ) -> pd.DataFrame:
-    """The full recommendation table over currently-available players."""
+    """The recommendation table for a team's perspective (defaults to you)."""
+    team = team if team is not None else state.my_team
     avail = state.available(players)
     if avail.empty:
         return avail
 
     avail = add_vorp(avail, config)
-    next_pick = state.my_next_pick() or state.next_overall
+    next_pick = (state.my_next_pick() or state.next_overall) if team == state.my_team else state.next_overall
     avail = add_vona(avail, next_pick, config)
     avail = assign_tiers(avail)
 
-    need = positional_need(state, config)
+    need = positional_need(state, config, team)
     avail["need"] = avail["pos"].map(need).fillna(0.0)
 
-    # Drop positions your league doesn't start, and defer K/DST/IDP.
-    supp = suppressed_positions(state, config)
+    # Drop positions the league doesn't start, and defer K/DST/IDP.
+    supp = suppressed_positions(state, config, team)
     if supp:
         avail = avail[~avail["pos"].isin(supp)]
     if avail.empty:
         avail["sim_ev"] = []
         return avail
 
-    # marginal starting-lineup value: how much this player improves YOUR
-    # optimal starting lineup right now. A 3rd RB when your RB slots are full
-    # adds ~0; a WR when you have none adds a lot. This is what makes the board
-    # roster-aware instead of just ranking abstract value.
+    # marginal starting-lineup value: how much this player improves the team's
+    # optimal starting lineup right now. A 3rd RB when RB slots are full adds
+    # ~0; a WR when they have none adds a lot. Makes the board roster-aware.
     proj_lookup = dict(zip(players["player_id"].astype(str), players["proj"].astype(float)))
     my_rows = [{"pos": p.pos, "proj": proj_lookup.get(str(p.player_id), 0.0)}
-               for p in state.my_roster()]
+               for p in state.roster_of(team)]
     base_val = optimal_lineup_value(my_rows, config)
     avail["marginal"] = [
         optimal_lineup_value(my_rows + [{"pos": pos, "proj": pr}], config) - base_val

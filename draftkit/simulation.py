@@ -56,6 +56,61 @@ def pick_probabilities(sim_df: pd.DataFrame, n_samples: int = 20000, seed: int =
     return {str(pid): float(p) for pid, p in zip(sim_df["player_id"], probs)}
 
 
+def availability_until(
+    state: DraftState,
+    players: pd.DataFrame,
+    config: LeagueConfig,
+    until_overall: int,
+    target_ids: list,
+    n_sims: int = 300,
+    opp_temp: float = 5.0,
+    opp_pool: int = 12,
+    seed: int = 0,
+) -> dict:
+    """P(each target player is still available at `until_overall`).
+
+    Simulates only the opponent picks between now and your next pick (fast),
+    using the same need-aware opponent model, and counts how often each target
+    survives. If it's already your turn, everyone is available (1.0).
+    """
+    from collections import Counter
+
+    from .valuation import add_vorp
+
+    targets = {str(t) for t in target_ids}
+    if not targets or until_overall <= state.next_overall:
+        return {t: 1.0 for t in targets}
+
+    rng = np.random.default_rng(seed)
+    avail = add_vorp(state.available(players), config).sort_values("adp").reset_index(drop=True)
+    span = until_overall - state.next_overall
+    cap = min(len(avail), max(60, span + 40))
+    base_board = _rows_to_records(avail.head(cap))
+    need_ctx = _make_need_ctx(config)
+
+    seed_counts = {t: Counter() for t in range(1, state.team_count + 1)}
+    for t, picks in state.rosters().items():
+        seed_counts[t] = Counter(pk.pos for pk in picks)
+
+    survived = {t: 0 for t in targets}
+    for _ in range(n_sims):
+        board = [dict(r) for r in base_board]
+        counts = {t: Counter(c) for t, c in seed_counts.items()}
+        overall = state.next_overall
+        while overall < until_overall and board:
+            team = state.team_on_clock(overall)
+            if team != state.my_team:
+                idx = _opponent_pick(board, overall, counts[team], need_ctx, rng, opp_temp, opp_pool)
+                if idx >= 0:
+                    counts[team][board.pop(idx)["pos"]] += 1
+            overall += 1
+        remaining = {r["player_id"] for r in board}
+        for t in targets:
+            if t in remaining:
+                survived[t] += 1
+    return {t: survived[t] / n_sims for t in targets}
+
+
 def _rows_to_records(df: pd.DataFrame) -> List[dict]:
     cols = ["player_id", "name", "pos", "proj", "adp"]
     if "vorp" in df.columns:

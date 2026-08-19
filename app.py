@@ -411,19 +411,24 @@ with tab_draft:
     c3.metric("On the clock", seat_name(state.current_team))
     c4.metric("Until your pick", state.picks_until_my_turn())
 
-    if state.is_my_turn():
-        st.success("**You are on the clock.** Recommendations below.")
+    on_clock = state.current_team
+    my_turn = state.is_my_turn()
+    if my_turn:
+        st.success("**You are on the clock.** Your best picks below.")
+    else:
+        st.markdown(f"On the clock: **{seat_name(on_clock)}** — showing the best "
+                    f"pick *for them* (a read on what may go before your turn).")
 
+    # Confidence sim runs only for YOUR decision (near your pick). For opponents
+    # we show their roster-aware best-available board as a fast prediction.
     sim_results = None
-    near_turn = state.is_my_turn() or state.picks_until_my_turn() <= sim_lookahead
-    if use_sim and near_turn and state.next_overall <= state.total_picks:
+    near_turn = my_turn or state.picks_until_my_turn() <= sim_lookahead
+    if use_sim and my_turn and state.next_overall <= state.total_picks:
         with st.spinner("Simulating the rest of the draft..."):
             sim_results = cached_sim(sim_signature(), state, players, cfg, n_sims, n_cands)
-    elif use_sim and not near_turn:
-        st.caption(f"Showing the fast VORP/VONA board — a Monte Carlo runs "
-                   f"automatically once you're within {sim_lookahead} picks of the clock.")
 
-    board = build_board(state, players, cfg, sim_results)
+    # main board = the ON-CLOCK team's perspective
+    board = build_board(state, players, cfg, sim_results, team=on_clock)
 
     # confidence: P(this candidate is the best pick), from the simulation spread
     probs = {}
@@ -532,6 +537,51 @@ with tab_draft:
                 st.rerun()
 
     with right:
+        section("Your pick — quick view")
+        # your own best targets (your perspective), concise + survival odds
+        my_board = build_board(state, players, cfg, team=state.my_team)
+        my_next = state.my_next_pick() or state.next_overall
+        if my_board.empty:
+            st.caption("Nothing to suggest.")
+        else:
+            targets = my_board.head(5).copy()
+            from draftkit.simulation import availability_until
+            avail_map = availability_until(
+                state, players, cfg, my_next, targets["player_id"].tolist(), n_sims=250,
+            )
+            targets["avail"] = targets["player_id"].astype(str).map(avail_map).fillna(1.0) * 100
+
+            if my_turn:
+                st.caption("It's your pick — these are available now.")
+            else:
+                st.caption(f"Your next pick is overall #{my_next} "
+                           f"({state.picks_until_my_turn()} away). "
+                           f"“Avail” = chance the player is still there.")
+
+            # highlight your #1 target
+            t0 = targets.iloc[0]
+            avail_txt = "" if my_turn else f" · {float(t0['avail']):.0f}% avail"
+            st.markdown(
+                f"<div style='padding:10px 14px;border-left:4px solid #943c3c;"
+                f"background:#f2ede6;border-radius:6px;margin-bottom:8px;'>"
+                f"<span style='font-size:0.65rem;letter-spacing:2px;text-transform:"
+                f"uppercase;color:#888;'>Your best pick</span><br>"
+                f"<span style='font-size:1.1rem;font-weight:700;color:#943c3c;'>"
+                f"{t0['name']}</span> <span style='color:#555;'>({t0['pos']})"
+                f"{avail_txt}</span></div>",
+                unsafe_allow_html=True,
+            )
+
+            mini = targets[["name", "pos", "avail"]].copy()
+            try:
+                msty = mini.style.map(
+                    lambda v: f"color:{_POS_COLORS.get(v, '#2c2c2c')};font-weight:600",
+                    subset=["pos"]).format({"avail": "{:.0f}%"})
+                st.dataframe(msty, use_container_width=True, hide_index=True)
+            except Exception:
+                mini["avail"] = mini["avail"].map(lambda v: f"{v:.0f}%")
+                st.dataframe(mini, use_container_width=True, hide_index=True)
+
         section("Your roster")
         mine = state.my_roster()
         proj_by_id = dict(zip(players["player_id"].astype(str), players["proj"].astype(float)))

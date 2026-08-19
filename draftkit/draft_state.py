@@ -168,8 +168,11 @@ class DraftState:
             out[p.team].append(p)
         return out
 
+    def roster_of(self, team: int) -> List[Pick]:
+        return [p for p in self.picks + self.reserved_picks if p.team == team]
+
     def my_roster(self) -> List[Pick]:
-        return [p for p in self.picks + self.reserved_picks if p.team == self.my_team]
+        return self.roster_of(self.my_team)
 
     def available(self, players):
         """Undrafted rows, excluding kept players still reserved off the board."""
