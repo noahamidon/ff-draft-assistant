@@ -268,6 +268,12 @@ sim_lookahead = st.sidebar.slider(
     help="When you're further away than this, the fast VORP/VONA board is shown "
          "instead — no need to simulate a pick that's 30 slots off.",
 )
+defense = st.sidebar.slider(
+    "Draft defense (depth / blocking)", 0.0, 0.5, 0.15, step=0.05,
+    help="Small bonus for scarce, high-value players even if they'd sit your "
+         "bench — insurance value and denying rivals. Kept a fraction so it "
+         "never outweighs filling your own starters. 0 = pure lineup optimization.",
+)
 
 if st.sidebar.button("Reset draft"):
     st.session_state.pop("state", None)
@@ -428,20 +434,23 @@ with tab_draft:
             sim_results = cached_sim(sim_signature(), state, players, cfg, n_sims, n_cands)
 
     # main board = the ON-CLOCK team's perspective
-    board = build_board(state, players, cfg, sim_results, team=on_clock)
+    board = build_board(state, players, cfg, sim_results, team=on_clock, defense=defense)
 
     # confidence: P(this candidate is the best pick), from the simulation spread
     probs = {}
     if sim_results is not None and not sim_results.empty:
         from draftkit.simulation import pick_probabilities
         probs = pick_probabilities(sim_results)
-        # rank the board by confidence so the top row == highest % == the banner.
-        # (sim_ev orders by average outcome; confidence also rewards certainty,
-        # so they can disagree — confidence is the better "who to draft" answer.)
+        # rank by confidence, with a small draft-defense nudge (scarce/high-value
+        # players get a minor bump even if bench-bound). Defense is capped small,
+        # so a genuine starter's confidence still dominates the #1 slot.
+        vmax = max(float(board["vorp"].clip(lower=0).max()), 1.0)
         board["_conf"] = board["player_id"].astype(str).map(probs)
-        board = board.sort_values(
-            "_conf", ascending=False, na_position="last", kind="stable"
-        ).drop(columns="_conf").reset_index(drop=True)
+        bench_only = board["bench_only"] if "bench_only" in board else 0.0
+        board["_def"] = defense * (board["vorp"].clip(lower=0) / vmax) * bench_only
+        board["_rank"] = board["_conf"].fillna(-1.0) + board["_def"].fillna(0.0)
+        board = board.sort_values("_rank", ascending=False).drop(
+            columns=["_conf", "_def", "_rank"]).reset_index(drop=True)
 
     left, right = st.columns([3, 2])
 
@@ -539,7 +548,7 @@ with tab_draft:
     with right:
         # Your recommendation, always from your roster's view. On your turn the
         # look-ahead target is your NEXT pick; otherwise it's your upcoming pick.
-        my_board = board if my_turn else build_board(state, players, cfg, team=state.my_team)
+        my_board = board if my_turn else build_board(state, players, cfg, team=state.my_team, defense=defense)
         look_pick = state.my_pick_after_next() if my_turn else (state.my_next_pick() or state.next_overall)
 
         section("Around at your next pick?" if my_turn else "Your pick — quick view")

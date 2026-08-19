@@ -148,8 +148,15 @@ def build_board(
     config: LeagueConfig,
     sim_results: Optional[pd.DataFrame] = None,
     team: Optional[int] = None,
+    defense: float = 0.0,
 ) -> pd.DataFrame:
-    """The recommendation table for a team's perspective (defaults to you)."""
+    """The recommendation table for a team's perspective (defaults to you).
+
+    `defense` (0..~0.5) is the draft-defense dial: how much of a bench-only
+    player's scarcity value still counts (insurance + denying rivals). 0 =
+    pure starting-lineup optimization; higher = more willing to grab scarce
+    depth. It's deliberately a fraction, so it never outweighs filling starters.
+    """
     team = team if team is not None else state.my_team
     avail = state.available(players)
     if avail.empty:
@@ -187,10 +194,32 @@ def build_board(
         sd = s.std()
         return (s - s.mean()) / sd if sd > 1e-9 else s * 0.0
 
+    # "Startable headroom": positional value (VORP/VONA) should only count if
+    # the player can still claim a starting or flex slot. Once a position's
+    # dedicated + flex slots are full (e.g. a 3rd QB in a 2-QB superflex), extra
+    # players there can only ride the bench, so scarcity value is switched off
+    # and only genuine upgrade value (marginal) can lift them.
+    counts = defaultdict(int)
+    for p in state.roster_of(team):
+        counts[p.pos] += 1
+    flex_elig = set().union(*[e for _, e in config.flex_slots]) if config.flex_slots else set()
+    flex_surplus = sum(max(0, counts.get(p, 0) - config.starters.get(p, 0)) for p in flex_elig)
+    flex_open = max(0, config.flex_count - flex_surplus)
+
+    def _startable(pos: str) -> float:
+        ded_open = config.starters.get(pos, 0) - counts.get(pos, 0) > 0
+        return 1.0 if (ded_open or (pos in flex_elig and flex_open > 0)) else 0.0
+
+    startable = avail["pos"].map(_startable)
+    avail["bench_only"] = 1.0 - startable
+    # bench-only positions keep `defense` fraction of scarcity value (draft
+    # defense), startable positions keep it all.
+    mult = startable * (1.0 - defense) + defense
+
     avail["blended"] = (
         _z(avail["marginal"]) * 1.3
-        + _z(avail["vorp"]) * 0.7
-        + _z(avail["vona"]) * 0.4
+        + _z(avail["vorp"]) * 0.7 * mult
+        + _z(avail["vona"]) * 0.4 * mult
         + avail["need"] * 0.5
     )
 
