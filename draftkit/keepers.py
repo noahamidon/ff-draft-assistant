@@ -89,22 +89,27 @@ def evaluate_keepers(
     max_keep: int = 3,
     value_col: str = "vorp",
     candidate_ids: Optional[List[str]] = None,
+    other_keeper_overalls: Optional[List[int]] = None,
 ) -> KeeperResult:
     """Rank your keeper candidates and recommend how many to keep.
 
-    candidate_names   : your keeper options (matched against players["name"])
-    candidate_ids     : optional player_ids (matched first; more robust than
-                        names when roster + projections share ESPN ids)
-    other_keeper_ids  : player_ids kept by OTHER teams (removed from the pool)
-    my_slot           : your draft slot, 1..team_count
+    candidate_names       : your keeper options (matched against players["name"])
+    candidate_ids         : optional player_ids (matched first; more robust)
+    other_keeper_ids      : player_ids kept by OTHER teams (removed from pool)
+    other_keeper_overalls : the overall pick slots those rivals' keepers occupy.
+                            Keepers burn picks, so FEWER live picks happen before
+                            your slot -- meaning better players fall to you, which
+                            raises your draft alternative and lowers keeper value.
+                            Without this we fall back to assuming a normal draft.
+    my_slot               : your draft slot, 1..team_count
     """
     players = add_vorp(players, config) if value_col == "vorp" and "vorp" not in players else players.copy()
     if value_col not in players:
         players = add_vorp(players, config)
 
-    other_keeper_ids = set(other_keeper_ids or set())
+    other_keeper_ids = set(str(x) for x in (other_keeper_ids or set()))
+    okos = sorted(other_keeper_overalls) if other_keeper_overalls else None
 
-    # resolve candidates to rows: prefer ids, fall back to names
     if candidate_ids:
         cands = players[players["player_id"].astype(str).isin([str(c) for c in candidate_ids])].copy()
     else:
@@ -113,22 +118,32 @@ def evaluate_keepers(
 
     my_picks = pick_overall_numbers(my_slot, config.team_count, config.roster_size)
 
-    # pool of players gone before you draft = every keeper leaguewide.
-    # your own kept players also leave the pool; evaluate incrementally.
     per_rows = []
-    kept_ids: set = set()
-    drafted_away: set = set()
     for i, row in cands.iterrows():
         if i >= max_keep:
             break
         cost_round = i + 1                       # 1st keeper -> round 1, etc.
         overall = my_picks[cost_round - 1]
-        gone = other_keeper_ids | kept_ids | drafted_away
-        alt = best_available_value(players, gone, overall, value_col)
+
+        # keeper-free pool = players still draftable (exclude all rivals' keepers
+        # and the keepers you're keeping in this scenario)
+        my_kept = {str(cands.iloc[j]["player_id"]) for j in range(cost_round)}
+        gone = other_keeper_ids | my_kept
+        pool = players[~players["player_id"].astype(str).isin(gone)]
+        pool = pool.sort_values(value_col, ascending=False).reset_index(drop=True)
+
+        # how many LIVE picks happen before your slot? Total prior picks minus
+        # the keeper slots sitting before you (rivals' + your own earlier keepers).
+        if okos is not None:
+            keepers_before = sum(1 for o in okos if o < overall) + (cost_round - 1)
+            live_before = max(0, (overall - 1) - keepers_before)
+        else:
+            live_before = overall - 1            # fallback: assume a full draft
+        idx = min(live_before, len(pool) - 1) if len(pool) else 0
+
+        alt = pool.iloc[idx] if len(pool) else None
         alt_val = float(alt[value_col]) if alt is not None else 0.0
         alt_name = alt["name"] if alt is not None else "(none)"
-        if alt is not None:
-            drafted_away.add(str(alt["player_id"]))
         keeper_val = float(row[value_col])
         per_rows.append({
             "keeper": row["name"],
@@ -140,14 +155,12 @@ def evaluate_keepers(
             "pick_value": round(alt_val, 1),
             "surplus": round(keeper_val - alt_val, 1),
         })
-        kept_ids.add(str(row["player_id"]))
 
     per_keeper = pd.DataFrame(per_rows)
 
     # net surplus for keeping exactly k (cumulative)
-    by_rows = []
+    by_rows = [{"keep": 0, "net_surplus": 0.0}]
     running = 0.0
-    by_rows.append({"keep": 0, "net_surplus": 0.0})
     for k in range(1, len(per_keeper) + 1):
         running += per_keeper.iloc[k - 1]["surplus"]
         by_rows.append({"keep": k, "net_surplus": round(running, 1)})

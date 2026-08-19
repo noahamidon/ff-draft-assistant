@@ -780,16 +780,26 @@ with tab_keepers:
 
     if submitted:
         other_keeper_ids: set = set()
+        other_keeper_overalls: list = []
         labels = []
+        order = st.session_state.get("pick_order", [])
+        from draftkit.keepers import pick_overall_numbers
         if rosters:
             for tid in sorted(rosters):
                 if tid == int(my_team_id):
                     continue
-                for nm in st.session_state.get(f"keep_team_{tid}", []):
+                names_kept = st.session_state.get(f"keep_team_{tid}", [])
+                for nm in names_kept:
                     row = next((p for p in rosters[tid] if p["name"] == nm), None)
                     if row:
                         other_keeper_ids.add(_resolve_pid(row) or str(row["player_id"]))
                         labels.append(f"{_tname(tid)} kept {nm}")
+                # the pick slots those keepers occupy (that team's rounds 1..c)
+                c = len(names_kept)
+                if c and tid in order:
+                    seat = order.index(tid) + 1
+                    other_keeper_overalls += pick_overall_numbers(
+                        seat, cfg.team_count, cfg.roster_size)[:c]
         else:
             for nm in st.session_state.get("keep_flat", []):
                 other_keeper_ids.add(name_to_pid[nm])
@@ -799,6 +809,7 @@ with tab_keepers:
             res = evaluate_keepers(
                 [], players, cfg, int(my_slot_val),
                 other_keeper_ids=other_keeper_ids, candidate_ids=my_candidate_ids,
+                other_keeper_overalls=other_keeper_overalls or None,
             )
             st.session_state.keeper_result = {
                 "per": res.per_keeper, "by": res.by_count,
