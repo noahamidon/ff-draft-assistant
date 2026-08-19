@@ -425,6 +425,13 @@ with tab_draft:
     if sim_results is not None and not sim_results.empty:
         from draftkit.simulation import pick_probabilities
         probs = pick_probabilities(sim_results)
+        # rank the board by confidence so the top row == highest % == the banner.
+        # (sim_ev orders by average outcome; confidence also rewards certainty,
+        # so they can disagree — confidence is the better "who to draft" answer.)
+        board["_conf"] = board["player_id"].astype(str).map(probs)
+        board = board.sort_values(
+            "_conf", ascending=False, na_position="last", kind="stable"
+        ).drop(columns="_conf").reset_index(drop=True)
 
     left, right = st.columns([3, 2])
 
