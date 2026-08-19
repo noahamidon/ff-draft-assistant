@@ -108,6 +108,7 @@ def load_projections(
     df["proj"] = df["proj"].astype(float)
     df["adp"] = df["adp"].astype(float)
     df["std"] = df["std"].astype(float)
+    df["player_id"] = df["player_id"].astype(str)
 
     cols = ["player_id", "name", "pos", "team", "proj", "adp", "std"]
     return df[cols].sort_values("proj", ascending=False).reset_index(drop=True)

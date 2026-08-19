@@ -420,7 +420,18 @@ with tab_draft:
 
     board = build_board(state, players, cfg, sim_results)
 
+    # confidence: P(this candidate is the best pick), from the simulation spread
+    probs = {}
+    if sim_results is not None and not sim_results.empty:
+        from draftkit.simulation import pick_probabilities
+        probs = pick_probabilities(sim_results)
+
     left, right = st.columns([3, 2])
+
+    _POS_COLORS = {
+        "QB": "#3d6e4e", "RB": "#943c3c", "WR": "#9e862f",
+        "TE": "#b07348", "K": "#6b6b6b", "IDP": "#4a6670", "DST": "#6b6b6b",
+    }
 
     with left:
         section("Recommended picks")
@@ -428,15 +439,58 @@ with tab_draft:
             st.info("Draft complete.")
         else:
             top = board.head(8).copy()
+            top["confidence"] = top["player_id"].astype(str).map(probs).astype(float) * 100
+
+            # colored top-pick banner
+            tr = board.iloc[0]
+            conf = probs.get(str(tr["player_id"]))
+            if conf is not None:
+                pct = conf * 100
+                color = "#3d6e4e" if pct >= 70 else ("#9e862f" if pct >= 45 else "#943c3c")
+                verdict = ("clear pick" if pct >= 70 else
+                           "lean" if pct >= 45 else "close call")
+                st.markdown(
+                    f"<div style='padding:12px 16px;border-left:5px solid {color};"
+                    f"background:#f2ede6;border-radius:6px;margin-bottom:12px;'>"
+                    f"<span style='font-size:0.7rem;letter-spacing:2px;text-transform:"
+                    f"uppercase;color:#888;'>Top pick · {verdict}</span><br>"
+                    f"<span style='font-size:1.4rem;font-weight:700;color:{color};'>"
+                    f"{tr['name']}</span> <span style='color:#555;'>({tr['pos']}, "
+                    f"{tr['team']}) — {pct:.0f}% confidence</span></div>",
+                    unsafe_allow_html=True,
+                )
+
             top["why"] = top.apply(lambda r: reason_for(r, cfg), axis=1)
             show_cols = ["name", "pos", "team", "proj", "vorp", "vona", "tier"]
             if top["sim_ev"].notna().any():
-                show_cols.insert(4, "sim_ev")
+                show_cols.insert(3, "sim_ev")
+            if top["confidence"].notna().any():
+                show_cols.insert(0, "confidence")
             display = top[show_cols + ["why"]].copy()
             for col in ("proj", "vorp", "vona", "sim_ev"):
                 if col in display:
                     display[col] = display[col].round(1)
-            st.dataframe(display, use_container_width=True, hide_index=True)
+
+            def _conf_bg(v):
+                if pd.isna(v):
+                    return ""
+                frac = min(max(v / 100.0, 0), 1)
+                return f"background-color: rgba(61,110,78,{0.12 + 0.55 * frac:.2f}); font-weight:600"
+
+            try:
+                sty = display.style
+                if "confidence" in display:
+                    sty = sty.map(_conf_bg, subset=["confidence"]).format({"confidence": "{:.0f}%"})
+                sty = sty.map(
+                    lambda v: f"color:{_POS_COLORS.get(v, '#2c2c2c')}; font-weight:600",
+                    subset=["pos"],
+                )
+                st.dataframe(sty, use_container_width=True, hide_index=True)
+            except Exception:  # styling is cosmetic; never let it break the board
+                if "confidence" in display:
+                    display["confidence"] = display["confidence"].map(
+                        lambda v: "" if pd.isna(v) else f"{v:.0f}%")
+                st.dataframe(display, use_container_width=True, hide_index=True)
 
             st.markdown("**Draft a player** (assigns to the team on the clock):")
             pick_pool = state.available(players).sort_values("adp").head(50)
@@ -458,17 +512,28 @@ with tab_draft:
     with right:
         section("Your roster")
         mine = state.my_roster()
+        proj_by_id = dict(zip(players["player_id"].astype(str), players["proj"].astype(float)))
         if mine:
             rdf = pd.DataFrame([{"round": p.round, "player": p.name, "pos": p.pos} for p in mine])
-            st.dataframe(rdf, use_container_width=True, hide_index=True)
+            try:
+                rsty = rdf.style.map(
+                    lambda v: f"color:{_POS_COLORS.get(v, '#2c2c2c')}; font-weight:600",
+                    subset=["pos"])
+                st.dataframe(rsty, use_container_width=True, hide_index=True)
+            except Exception:
+                st.dataframe(rdf, use_container_width=True, hide_index=True)
             from draftkit.valuation import optimal_lineup_value
-            roster_rows = [
-                {"pos": p.pos,
-                 "proj": float(players.loc[players["player_id"] == p.player_id, "proj"].iloc[0])
-                 if (players["player_id"] == p.player_id).any() else 0.0}
-                for p in mine
-            ]
-            st.metric("Starting lineup value", f"{optimal_lineup_value(roster_rows, cfg):.0f} pts")
+            roster_rows = [{"pos": p.pos, "proj": proj_by_id.get(str(p.player_id), 0.0)}
+                           for p in mine]
+            lineup_val = optimal_lineup_value(roster_rows, cfg)
+            st.markdown(
+                f"<div style='padding:10px 14px;background:#3d6e4e;border-radius:6px;"
+                f"color:#fdf4e8;'><span style='font-size:0.7rem;letter-spacing:2px;"
+                f"text-transform:uppercase;opacity:0.85;'>Starting lineup value</span>"
+                f"<br><span style='font-size:1.6rem;font-weight:700;'>{lineup_val:.0f}"
+                f" pts</span></div>",
+                unsafe_allow_html=True,
+            )
         else:
             st.caption("No picks yet.")
 

@@ -36,6 +36,26 @@ class SimResult:
     n_sims: int
 
 
+def pick_probabilities(sim_df: pd.DataFrame, n_samples: int = 20000, seed: int = 0) -> dict:
+    """P(each candidate yields the best final lineup), from the sim's mean/std.
+
+    Samples each candidate's final-roster value from Normal(mean, std) and counts
+    how often each is the argmax. Big, clear gaps -> the top pick approaches
+    ~100%; tightly bunched candidates split the probability (e.g. 30% / 29%),
+    which is exactly the confidence signal we want to surface.
+    """
+    if sim_df is None or sim_df.empty:
+        return {}
+    rng = np.random.default_rng(seed)
+    means = sim_df["mean_value"].to_numpy(dtype=float)
+    stds = np.maximum(sim_df["std_value"].to_numpy(dtype=float), 1e-6)
+    draws = rng.normal(means, stds, size=(n_samples, len(means)))
+    winners = draws.argmax(axis=1)
+    counts = np.bincount(winners, minlength=len(means))
+    probs = counts / float(n_samples)
+    return {str(pid): float(p) for pid, p in zip(sim_df["player_id"], probs)}
+
+
 def _rows_to_records(df: pd.DataFrame) -> List[dict]:
     cols = ["player_id", "name", "pos", "proj", "adp"]
     if "vorp" in df.columns:
