@@ -538,8 +538,13 @@ with tab_draft:
 
     with right:
         section("Your pick — quick view")
-        # your own best targets (your perspective), concise + survival odds
-        my_board = build_board(state, players, cfg, team=state.my_team)
+        # On your turn, mirror the exact confidence-ranked board from the main
+        # panel (same calculation, just condensed). Otherwise show your own
+        # roster-aware board with survival odds to your next pick.
+        if my_turn:
+            my_board = board
+        else:
+            my_board = build_board(state, players, cfg, team=state.my_team)
         my_next = state.my_next_pick() or state.next_overall
         if my_board.empty:
             st.caption("Nothing to suggest.")
