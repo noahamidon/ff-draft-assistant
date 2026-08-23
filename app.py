@@ -558,18 +558,26 @@ with tab_draft:
             st.caption("This is your last pick — no next pick to look ahead to.")
         else:
             from draftkit.simulation import availability_until
-            cand = my_board.head(10).copy().reset_index(drop=True)
-            avail_map = availability_until(
-                state, players, cfg, look_pick, cand["player_id"].tolist(), n_sims=250,
-            )
-            cand["avail"] = cand["player_id"].astype(str).map(avail_map).fillna(1.0) * 100
-
-            # fold availability into the ordering: a mild urgency boost so a
-            # scarce, high-value target edges above one that'll come back.
-            n = max(1, len(cand) - 1)
-            cand["_value_rank"] = 1 - cand.index / n
-            cand["priority"] = cand["_value_rank"] + 0.35 * (1 - cand["avail"] / 100)
-            cand = cand.sort_values("priority", ascending=False).head(5).reset_index(drop=True)
+            if my_turn:
+                # exactly the main board's top 5, in the same order, with the
+                # odds each falls back to your next pick appended.
+                cand = my_board.head(5).copy().reset_index(drop=True)
+                avail_map = availability_until(
+                    state, players, cfg, look_pick, cand["player_id"].tolist(), n_sims=250,
+                )
+                cand["avail"] = cand["player_id"].astype(str).map(avail_map).fillna(1.0) * 100
+            else:
+                cand = my_board.head(10).copy().reset_index(drop=True)
+                avail_map = availability_until(
+                    state, players, cfg, look_pick, cand["player_id"].tolist(), n_sims=250,
+                )
+                cand["avail"] = cand["player_id"].astype(str).map(avail_map).fillna(1.0) * 100
+                # fold availability into the ordering: a mild urgency boost so a
+                # scarce, high-value target edges above one that'll come back.
+                n = max(1, len(cand) - 1)
+                cand["_value_rank"] = 1 - cand.index / n
+                cand["priority"] = cand["_value_rank"] + 0.35 * (1 - cand["avail"] / 100)
+                cand = cand.sort_values("priority", ascending=False).head(5).reset_index(drop=True)
 
             if my_turn:
                 st.caption(f"Draft now (main panel), but here's how likely each "
