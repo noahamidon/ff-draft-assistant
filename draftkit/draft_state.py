@@ -44,21 +44,31 @@ class DraftState:
     def total_picks(self) -> int:
         return self.team_count * self.config.roster_size
 
+    @property
+    def linear_rounds(self) -> int:
+        """Leading non-snaking rounds (the keeper rounds). ESPN runs these in
+        set order; the snake begins the round after."""
+        return int(getattr(self.config, "keeper_rounds", 0) or 0)
+
     # -- snake order --------------------------------------------------------
     def team_on_clock(self, overall: int) -> int:
-        """1-indexed team for a given 1-indexed overall pick number."""
+        """1-indexed seat for a 1-indexed overall pick. Keeper rounds run in set
+        (forward) order; snaking starts forward the round after them."""
         rnd = (overall - 1) // self.team_count          # 0-indexed round
         idx = (overall - 1) % self.team_count           # 0-indexed slot
-        if rnd % 2 == 0:
-            return idx + 1
-        return self.team_count - idx                    # reverse on odd rounds
+        if rnd < self.linear_rounds:
+            return idx + 1                               # linear keeper round
+        if (rnd - self.linear_rounds) % 2 == 0:
+            return idx + 1                               # forward
+        return self.team_count - idx                     # reverse
 
     def overall_for(self, seat: int, rnd: int) -> int:
         """Overall pick number for a seat's round (both 1-indexed)."""
         rr = rnd - 1
-        if rr % 2 == 0:
-            return rr * self.team_count + seat
-        return rr * self.team_count + (self.team_count - seat + 1)
+        base = rr * self.team_count
+        if rr < self.linear_rounds or (rr - self.linear_rounds) % 2 == 0:
+            return base + seat                           # forward
+        return base + (self.team_count - seat + 1)       # reverse
 
     @property
     def next_overall(self) -> int:

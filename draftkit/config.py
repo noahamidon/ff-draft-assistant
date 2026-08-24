@@ -91,6 +91,7 @@ class LeagueConfig:
     # scoring points keyed by our stat labels (best-effort from ESPN)
     scoring: Dict[str, float] = field(default_factory=dict)
     superflex: bool = False
+    keeper_rounds: int = 0          # leading non-snaking (linear) rounds
 
     # -- derived ------------------------------------------------------------
     @property
@@ -147,6 +148,7 @@ class LeagueConfig:
             bench=int(raw.get("bench", 6)),
             scoring={k: float(v) for k, v in raw.get("scoring", {}).items()},
             superflex=bool(raw.get("superflex", False)),
+            keeper_rounds=int(raw.get("keeper_rounds", 0)),
         )
 
     @classmethod
@@ -207,6 +209,8 @@ class LeagueConfig:
         if not flex_slots:
             flex_slots = [(0, set())]
 
+        keeper_rounds = int(settings.get("draftSettings", {}).get("keeperCount", 0) or 0)
+
         return cls(
             name=name,
             team_count=team_count,
@@ -215,4 +219,5 @@ class LeagueConfig:
             bench=bench or 6,
             scoring=scoring,
             superflex=superflex,
+            keeper_rounds=keeper_rounds,
         )

@@ -807,7 +807,7 @@ with tab_keepers:
                 if c and tid in order:
                     seat = order.index(tid) + 1
                     other_keeper_overalls += pick_overall_numbers(
-                        seat, cfg.team_count, cfg.roster_size)[:c]
+                        seat, cfg.team_count, cfg.roster_size, cfg.keeper_rounds)[:c]
         else:
             for nm in st.session_state.get("keep_flat", []):
                 other_keeper_ids.add(name_to_pid[nm])

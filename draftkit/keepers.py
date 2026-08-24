@@ -28,14 +28,16 @@ from .config import LeagueConfig
 from .valuation import add_vorp, prob_available
 
 
-def pick_overall_numbers(my_slot: int, team_count: int, rounds: int) -> List[int]:
-    """Overall pick numbers for a given draft slot in a snake draft."""
+def pick_overall_numbers(my_slot: int, team_count: int, rounds: int, linear_rounds: int = 0) -> List[int]:
+    """Overall pick numbers for a draft slot. The first `linear_rounds` run in
+    set order (keeper rounds); snaking begins the round after."""
     picks = []
     for r in range(rounds):                      # 0-indexed round
-        if r % 2 == 0:
-            picks.append(r * team_count + my_slot)
+        base = r * team_count
+        if r < linear_rounds or (r - linear_rounds) % 2 == 0:
+            picks.append(base + my_slot)          # forward
         else:
-            picks.append(r * team_count + (team_count - my_slot + 1))
+            picks.append(base + (team_count - my_slot + 1))  # reverse
     return picks
 
 
@@ -116,7 +118,8 @@ def evaluate_keepers(
         cands = players[players["name"].isin(candidate_names)].copy()
     cands = cands.sort_values(value_col, ascending=False).reset_index(drop=True)
 
-    my_picks = pick_overall_numbers(my_slot, config.team_count, config.roster_size)
+    my_picks = pick_overall_numbers(my_slot, config.team_count, config.roster_size,
+                                    getattr(config, "keeper_rounds", 0))
 
     per_rows = []
     for i, row in cands.iterrows():
