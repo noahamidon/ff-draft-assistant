@@ -733,57 +733,44 @@ with tab_keepers:
         f"Rosters loaded: **{len(rosters)}**."
     )
 
-    # ---- your candidates: auto from your roster (cheap, no input) ---------
-    section("Your keeper candidates — your whole roster, automatically")
-    my_candidate_ids = []
-    unmatched = []
-    if rosters and int(my_team_id) in rosters:
-        my_roster_players = rosters[int(my_team_id)]
-        for p in my_roster_players:
-            rid = _resolve_pid(p)
-            if rid:
-                my_candidate_ids.append(rid)
-            else:
-                unmatched.append(p["name"])
-        st.caption(
-            f"Considering {len(my_candidate_ids)} of {len(my_roster_players)} "
-            f"players on {_tname(int(my_team_id))} (matched to projections). "
-            + (f"Unmatched (no projection — e.g. IDP/K): {', '.join(unmatched)}"
-               if unmatched else "")
-        )
-        if not my_candidate_ids:
-            st.warning(
-                "None of your roster matched the projections. Fix: in the sidebar "
-                "set Source = ESPN and **Pull ESPN projections now**, then reload rosters."
-            )
-    else:
-        picked = st.multiselect(
-            "Your keeper options (load rosters to auto-fill from your team)",
-            options=sorted(name_to_pid.keys()),
-        )
-        my_candidate_ids = [name_to_pid[n] for n in picked]
+    pool_names = sorted(name_to_pid.keys())
+    name_to_pos = {r["name"]: r["pos"] for _, r in players.iterrows()}
+    team_ids = (sorted(rosters) if rosters
+                else sorted(team_names) if team_names
+                else list(range(1, cfg.team_count + 1)))
+    rosters_populated = bool(rosters) and any(len(v) > 0 for v in rosters.values())
 
-    # ---- rival keepers inside a FORM: nothing recomputes until you submit --
+    # ---- your keeper candidates: pick from the full pool (auto-fill if the
+    #      roster is already populated, e.g. mid-draft) ---------------------
+    section("Your keeper candidates")
+    default_my = []
+    if rosters_populated and int(my_team_id) in rosters:
+        for p in rosters[int(my_team_id)]:
+            rid = _resolve_pid(p)
+            nm = next((n for n, pid in name_to_pid.items() if pid == rid), None) if rid else None
+            if nm:
+                default_my.append(nm)
+    st.caption("Add the players you're considering keeping. Rosters are empty until "
+               "the draft fills them, so just search the full list — this works live.")
+    picked_my = st.multiselect("Your keeper candidates", options=pool_names,
+                               default=default_my, key="my_keepers_sel")
+    my_candidate_ids = [name_to_pid[n] for n in picked_my]
+
+    # ---- rival keepers in a form (full pool, per team) --------------------
     section("Other teams' keepers")
-    st.caption("Mark each rival's keepers, then press **Compute** — selections "
-               "don't trigger a recalculation until you commit them.")
+    st.caption("For each rival, search and add the player(s) they've kept. "
+               "Nothing recalculates until you press Compute.")
+    if not st.session_state.get("pick_order"):
+        st.warning("Pull league settings in the Settings tab so teams map to draft "
+                   "seats — needed to place rival keepers on the board correctly.")
+    others = [t for t in team_ids if t != int(my_team_id)]
     with st.form("keepers_form"):
-        if rosters:
-            fcols = st.columns(2)
-            others_sorted = [t for t in sorted(rosters) if t != int(my_team_id)]
-            for i, tid in enumerate(others_sorted):
-                with fcols[i % 2]:
-                    st.multiselect(
-                        f"{_tname(tid)} kept:",
-                        options=[p["name"] for p in rosters[tid]],
-                        key=f"keep_team_{tid}",
-                        max_selections=4,
-                    )
-        else:
-            st.multiselect(
-                "Players kept by other teams (load rosters for the per-team view)",
-                options=sorted(name_to_pid.keys()), key="keep_flat",
-            )
+        fcols = st.columns(2)
+        for i, tid in enumerate(others):
+            with fcols[i % 2]:
+                st.multiselect(f"{_tname(tid)} kept:", options=pool_names,
+                               key=f"keep_team_{tid}",
+                               max_selections=cfg.keeper_rounds or 4)
         submitted = st.form_submit_button("Compute keeper recommendation", type="primary")
 
     if submitted:
@@ -792,25 +779,17 @@ with tab_keepers:
         labels = []
         order = st.session_state.get("pick_order", [])
         from draftkit.keepers import pick_overall_numbers
-        if rosters:
-            for tid in sorted(rosters):
-                if tid == int(my_team_id):
-                    continue
-                names_kept = st.session_state.get(f"keep_team_{tid}", [])
-                for nm in names_kept:
-                    row = next((p for p in rosters[tid] if p["name"] == nm), None)
-                    if row:
-                        other_keeper_ids.add(_resolve_pid(row) or str(row["player_id"]))
-                        labels.append(f"{_tname(tid)} kept {nm}")
-                # the pick slots those keepers occupy (that team's rounds 1..c)
-                c = len(names_kept)
-                if c and tid in order:
-                    seat = order.index(tid) + 1
-                    other_keeper_overalls += pick_overall_numbers(
-                        seat, cfg.team_count, cfg.roster_size, cfg.keeper_rounds)[:c]
-        else:
-            for nm in st.session_state.get("keep_flat", []):
-                other_keeper_ids.add(name_to_pid[nm])
+        for tid in others:
+            names_kept = st.session_state.get(f"keep_team_{tid}", [])
+            for nm in names_kept:
+                if nm in name_to_pid:
+                    other_keeper_ids.add(name_to_pid[nm])
+                    labels.append(f"{_tname(tid)} kept {nm}")
+            c = len(names_kept)
+            if c and tid in order:
+                seat = order.index(tid) + 1
+                other_keeper_overalls += pick_overall_numbers(
+                    seat, cfg.team_count, cfg.roster_size, cfg.keeper_rounds)[:c]
 
         if my_candidate_ids:
             from draftkit.keepers import evaluate_keepers
@@ -840,58 +819,54 @@ with tab_keepers:
                    "give up. Values are VORP, so superflex + your scoring are baked in.")
 
     # ---- apply keepers to the draft board ---------------------------------
-    if rosters:
-        section("Lock keepers into the draft")
-        st.caption("Applying keepers removes every kept player from the board and "
-                   "assigns each team's keepers to its first picks (1st→R1, 2nd→R2, "
-                   "3rd→R3). Do this once, before live drafting.")
+    section("Lock keepers into the draft")
+    st.caption("Applying keepers removes every kept player from the board and "
+               "assigns each team's keepers to its first picks (1st→R1, 2nd→R2, "
+               "3rd→R3). Do this once, before live drafting.")
 
-        my_roster_names = [p["name"] for p in rosters.get(int(my_team_id), [])]
-        default_keep = []
-        if kr and not kr["per"].empty:
-            default_keep = list(kr["per"].head(kr["keep"])["keeper"])
-        my_keepers = st.multiselect(
-            "Your keepers (these go off the board and use your first picks)",
-            options=my_roster_names, default=default_keep,
-            help="Defaults to the recommended set; adjust to whatever you'll actually keep.",
-        )
+    default_keep = []
+    if kr and not kr["per"].empty:
+        default_keep = [n for n in kr["per"].head(kr["keep"])["keeper"] if n in name_to_pid]
+    my_keepers = st.multiselect(
+        "Your keepers (these go off the board and use your first picks)",
+        options=pool_names, default=default_keep or picked_my,
+        key="apply_my_keepers",
+        help="Defaults to the recommended set; adjust to whatever you'll actually keep.",
+    )
 
-        if st.button("Apply keepers to draft board", type="primary"):
-            order = st.session_state.get("pick_order", [])
+    order = st.session_state.get("pick_order", [])
+    if st.button("Apply keepers to draft board", type="primary"):
+        keeper_slots: dict = {}
+        applied = 0
+        missing_seat = []
+        for tid in team_ids:
+            if tid == int(my_team_id):
+                names, seat = my_keepers, int(my_slot_val)
+            else:
+                names = st.session_state.get(f"keep_team_{tid}", [])
+                seat = order.index(tid) + 1 if tid in order else None
+            if not names:
+                continue
+            if seat is None:
+                missing_seat.append(_tname(tid))
+                continue
+            plist = [{"player_id": name_to_pid[nm], "name": nm, "pos": name_to_pos.get(nm, "")}
+                     for nm in names if nm in name_to_pid]
+            keeper_slots[seat] = plist
+            applied += len(plist)
 
-            def _seat_of(team_id: int):
-                return order.index(team_id) + 1 if team_id in order else None
-
-            keeper_slots: dict = {}
-            applied = 0
-            # rivals
-            for tid in sorted(rosters):
-                names = (my_keepers if tid == int(my_team_id)
-                         else st.session_state.get(f"keep_team_{tid}", []))
-                if not names:
-                    continue
-                seat = _seat_of(tid)
-                if seat is None:
-                    continue
-                plist = []
-                for nm in names:
-                    row = next((p for p in rosters[tid] if p["name"] == nm), None)
-                    if row:
-                        plist.append({
-                            "player_id": _resolve_pid(row) or str(row["player_id"]),
-                            "name": row["name"], "pos": row["pos"],
-                        })
-                keeper_slots[seat] = plist
-                applied += len(plist)
-
-            new_state = DraftState(config=cfg, my_team=int(my_slot_val))
-            new_state.set_keepers(keeper_slots)
-            new_state.auto_fill_keepers()
-            st.session_state.state = new_state
-            st.success(f"Locked in {applied} keepers across {len(keeper_slots)} teams. "
-                       f"They're off the board and hold each team's early picks. "
-                       f"Head to the Draft board tab.")
-            st.rerun()
+        new_state = DraftState(config=cfg, my_team=int(my_slot_val))
+        new_state.set_keepers(keeper_slots)
+        new_state.auto_fill_keepers()
+        st.session_state.state = new_state
+        msg = (f"Locked in {applied} keepers across {len(keeper_slots)} teams. "
+               f"They're off the board and hold each team's early picks. "
+               f"Head to the Draft board tab.")
+        if missing_seat:
+            msg += (f"  ⚠️ Couldn't place: {', '.join(missing_seat)} "
+                    f"(no draft seat — pull league settings).")
+        st.success(msg)
+        st.rerun()
 
 # ==========================================================================
 # TAB 3 (part B) -- LEAGUE & ROSTERS : loaded rosters
@@ -902,7 +877,12 @@ with tab_league:
         for tid in sorted(rosters):
             tag = "  ·  (you)" if tid == int(my_team_id) else ""
             st.markdown(f"**{_tname(tid)}**{tag}")
+            rdf = pd.DataFrame(rosters.get(tid) or [])
+            if rdf.empty:
+                st.caption("No players.")
+                continue
+            show = [c for c in ("name", "pos", "pro_team") if c in rdf.columns]
             st.dataframe(
-                pd.DataFrame(rosters[tid])[["name", "pos", "pro_team"]],
+                rdf[show] if show else rdf,
                 use_container_width=True, hide_index=True,
             )
