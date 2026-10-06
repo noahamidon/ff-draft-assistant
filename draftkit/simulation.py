@@ -119,6 +119,7 @@ def availability_until(
     for t, picks in state.rosters().items():
         seed_counts[t] = Counter(pk.pos for pk in picks)
 
+    reserved = state.reserved_overalls
     survived = {t: 0 for t in targets}
     for _ in range(n_sims):
         board = [dict(r) for r in base_board]
@@ -126,6 +127,9 @@ def availability_until(
         overall = state.next_overall
         while overall < until_overall and board:
             team = state.team_on_clock(overall)
+            if overall in reserved:          # keeper already holds this slot
+                overall += 1
+                continue
             if team != state.my_team:
                 idx = _model_opponent_idx(board, counts[team], need_ctx, rng)
                 if idx >= 0:
@@ -253,6 +257,7 @@ def simulate_candidates(
     for t, picks in state.rosters().items():
         seed_counts[t] = Counter(pk.pos for pk in picks)
 
+    reserved = state.reserved_overalls
     results: List[SimResult] = []
     for _, crow in candidates.iterrows():
         cand = {
@@ -273,6 +278,9 @@ def simulate_candidates(
             overall = start_overall + 1
             while overall <= total_picks and board:
                 team = state.team_on_clock(overall)
+                if overall in reserved:      # keeper already holds this slot
+                    overall += 1
+                    continue
                 if team == state.my_team:
                     idx = _greedy_my_pick(board, counts[team], need_ctx)
                     if idx >= 0:

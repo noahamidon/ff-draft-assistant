@@ -22,6 +22,7 @@ class Pick:
     player_id: str
     name: str
     pos: str
+    keeper: bool = False      # auto-filled from a keeper reservation
 
 
 @dataclass
@@ -81,23 +82,29 @@ class DraftState:
     def is_my_turn(self) -> bool:
         return self.current_team == self.my_team and self.next_overall <= self.total_picks
 
+    @property
+    def reserved_overalls(self) -> set:
+        """Overall slots already spoken for by a keeper (no live pick there)."""
+        return {p.overall for p in self.reserved_picks}
+
     def my_pick_numbers(self) -> List[int]:
-        return [o for o in range(1, self.total_picks + 1) if self.team_on_clock(o) == self.my_team]
+        res = self.reserved_overalls
+        return [o for o in range(1, self.total_picks + 1)
+                if self.team_on_clock(o) == self.my_team and o not in res]
+
+    def _my_live_picks_from_now(self):
+        res = self.reserved_overalls
+        for o in range(self.next_overall, self.total_picks + 1):
+            if self.team_on_clock(o) == self.my_team and o not in res:
+                yield o
 
     def my_next_pick(self) -> Optional[int]:
-        for o in range(self.next_overall, self.total_picks + 1):
-            if self.team_on_clock(o) == self.my_team:
-                return o
-        return None
+        return next(self._my_live_picks_from_now(), None)
 
     def my_pick_after_next(self) -> Optional[int]:
-        seen = 0
-        for o in range(self.next_overall, self.total_picks + 1):
-            if self.team_on_clock(o) == self.my_team:
-                seen += 1
-                if seen == 2:
-                    return o
-        return None
+        it = self._my_live_picks_from_now()
+        next(it, None)
+        return next(it, None)
 
     def picks_until_my_turn(self) -> int:
         nxt = self.my_next_pick()
@@ -135,6 +142,7 @@ class DraftState:
                 break
             for i, pk in enumerate(self.reserved_picks):
                 if pk.overall == o:
+                    pk.keeper = True
                     self.picks.append(pk)
                     self.drafted_ids.add(pk.player_id)
                     self.reserved_picks.pop(i)
@@ -163,10 +171,20 @@ class DraftState:
         return pk
 
     def undo(self) -> Optional[Pick]:
+        """Undo the last LIVE pick. Keeper picks auto-filled after it go back
+        into reservation (still off the board) instead of returning to the pool."""
+        def _restore_trailing_keepers():
+            while self.picks and self.picks[-1].keeper:
+                kp = self.picks.pop()
+                self.drafted_ids.discard(kp.player_id)
+                self.reserved_picks.append(kp)
+
+        _restore_trailing_keepers()
         if not self.picks:
             return None
         pk = self.picks.pop()
         self.drafted_ids.discard(pk.player_id)
+        _restore_trailing_keepers()
         return pk
 
     # -- rosters ------------------------------------------------------------

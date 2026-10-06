@@ -16,3 +16,8 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# saved league logins (ESPN cookies) -- never commit
+config/leagues.local.json
+config/leagues.local.json.tmp
+data/raw_season/

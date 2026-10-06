@@ -14,23 +14,58 @@ anyway off waivers aren't really yours.
 
 ## Hosting on GitHub / entering credentials
 
-This repo contains **no secrets**. Your ESPN cookies are entered at runtime in
-the app's **Settings tab** and held only in memory for that session — nothing
-is written to disk or committed. To use the app:
+This repo contains **no secrets**. Your ESPN login is entered in the app's
+**Settings** tab:
 
 1. `streamlit run app.py`
-2. Open the **Settings** tab, paste your **League ID**, **SWID**, and
-   **espn_s2** (the tab explains how to grab the cookies), and click
-   **Connect to ESPN**. Your real league, draft order, and team names load.
-3. Pull projections (sidebar) and go.
+2. Open **Settings**, give the league a name, paste your **League ID**,
+   **SWID**, and **espn_s2** (the tab explains how to grab the cookies), keep
+   **Remember this league** ticked, and click **Connect**.
+3. Repeat for each of your leagues — the same two cookies work for all of
+   them. Switch leagues any time from the sidebar's **Saved leagues** menu.
 
-You re-enter the cookies each time you start the app — they expire anyway.
+Saved leagues live in `config/leagues.local.json`, written with owner-only
+permissions and **gitignored**, and the app reconnects to the last one
+automatically. Untick **Remember** to keep a league in memory for that session
+only. Cookies expire every so often; when a reconnect fails, re-paste them in
+Settings.
 
-**Publishing:** push with `git` so `.gitignore` keeps `.env` and any pulled
-league data out of the repo. If you upload through GitHub's web UI instead
-(which ignores `.gitignore`), delete any local `.env` first. The `.env` file is
-optional — only useful if you'd rather pre-fill credentials for local dev, in
-which case the CLI scripts in `scripts/` can read them.
+**Publishing:** push with `git` so `.gitignore` keeps `config/leagues.local.json`,
+`.env`, and pulled league data out of the repo. If you upload through GitHub's
+web UI instead (which ignores `.gitignore`), delete those files first. The CLI
+scripts in `scripts/` use your active saved league (or pass a league name as
+the first argument), falling back to `.env`.
+
+---
+
+## In-season tools
+
+After connecting, the app pulls your rosters, ESPN's weekly projections, free
+agents, the NFL schedule, and recent transactions (**Refresh league data** in
+the sidebar re-pulls). Your team is detected from your SWID; if it isn't, pick
+it under **Your team** in the sidebar.
+
+- **Start / Sit** — picks the lineup that maximizes your *chance of winning*
+  this week, not just projected points. It reads the lineup your opponent has
+  actually set and how volatile it is: when you're favored it leans toward
+  safe floors, when you're the underdog it leans toward upside. It also shows
+  the changes to make versus your current ESPN lineup. Players whose games have
+  started are locked.
+- **Waivers** — free agents ranked by rest-of-season lineup points gained,
+  each paired with the drop that costs you least. This week counts at ESPN's
+  weekly projection, so bye and injury fill-ins get credit. Also shows waiver
+  order, FAAB left, and recent adds/drops across the league.
+- **Trades** — searches 1-for-1, 2-for-1 and 1-for-2 deals with every team
+  and lists the ones that help you with ≥60% confidence and that have a
+  realistic chance of being accepted. The evaluator scores any offer, one
+  you received or one you're drafting, for both sides.
+- **Outlook** — weekly power ranking, projected final wins, and playoff odds
+  from simulating the remaining schedule, next to ESPN's own odds, plus each of
+  your players' rest-of-season outlook and remaining byes.
+
+If something looks off against your real league, run
+`python scripts/dump_season.py` and check what ESPN returned in
+`data/raw_season/` (gitignored).
 
 ---
 
@@ -42,16 +77,11 @@ python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 2. configure secrets
-cp .env.example .env               # then edit .env (see "Grabbing cookies")
-
-# 3. make sample data so the app runs immediately
-
-# 4. confirm ESPN auth + pull your real league settings  <-- do this first
-python scripts/test_connection.py
-
-# 5. run the app
+# 2. run the app, then connect your league(s) in the Settings tab
 streamlit run app.py
+
+# optional: confirm ESPN auth + dump your parsed league rules from the CLI
+python scripts/test_connection.py
 ```
 
 If `streamlit run app.py` complains it can't find `draftkit`, run it from the
@@ -84,12 +114,12 @@ use the cookies panel in dev tools:
 3. Copy the **Value** of:
    - `SWID` — a GUID in curly braces `{....}` (keep the braces)
    - `espn_s2` — a long percent-encoded string
-4. Paste both into `.env`.
+4. Paste both into the app's Settings tab.
 
 Firefox: same under the **Storage** tab. Safari: enable the Develop menu first.
 
 **Security:** these two cookies are effectively your ESPN login. They live only
-in your local `.env`, which is gitignored. Never commit them. If one leaks, log
+in `config/leagues.local.json` (or `.env`), both gitignored. Never commit them. If one leaks, log
 out of ESPN and back in to rotate `espn_s2`.
 
 ---
@@ -123,8 +153,15 @@ draftkit/
   simulation.py   Monte Carlo over the remaining draft
   draft_state.py  snake order, picks, rosters, whose turn
   recommender.py  fold every signal into one ranked board + reasoning
-app.py            Streamlit front end
-scripts/          test_connection.py, pull_espn_projections.py
+  profiles.py     saved league logins (config/leagues.local.json)
+  season.py       in-season snapshot: rosters, projections, byes, ROS value
+  lineup.py       win-probability start/sit (exact slot assignment)
+  waivers.py      pickups + drops, waiver order, league activity
+  trades.py       trade evaluator + win-win trade search
+  outlook.py      rest-of-season simulation, playoff odds
+app.py            Streamlit front end (draft + settings)
+season_ui.py      in-season tabs
+scripts/          test_connection.py, pull_espn_projections.py, dump_season.py
 ```
 
 **How the recommendation is formed.** For each candidate you could take now, the

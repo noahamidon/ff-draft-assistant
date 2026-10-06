@@ -2,7 +2,8 @@
 
     python scripts/test_connection.py
 
-Reads LEAGUE_ID / SEASON / SWID / ESPN_S2 from your .env, connects to ESPN,
+Uses your active saved league (or a named one: test_connection.py "Work league"),
+falling back to LEAGUE_ID / SEASON / SWID / ESPN_S2 in .env; connects to ESPN,
 prints a parsed summary of your league rules, and writes the raw settings JSON
 to data/raw_settings.json so we can confirm the "weird" rules parse correctly
 before building the model on top of them.
@@ -19,18 +20,20 @@ from dotenv import load_dotenv
 
 from draftkit.config import LeagueConfig
 from draftkit.espn_client import ESPNClient
+from draftkit.profiles import cli_credentials
 
 load_dotenv()
 
 
 def main() -> int:
-    league_id = os.environ.get("LEAGUE_ID")
-    season = os.environ.get("SEASON", "2026")
-    swid = os.environ.get("SWID")
-    espn_s2 = os.environ.get("ESPN_S2")
+    creds = cli_credentials(sys.argv[1] if len(sys.argv) > 1 else None)
+    league_id = creds["LEAGUE_ID"]
+    season = creds["SEASON"]
+    swid = creds["SWID"]
+    espn_s2 = creds["ESPN_S2"]
 
     if not league_id:
-        print("ERROR: set LEAGUE_ID in your .env (copy .env.example to .env).")
+        print("ERROR: no league found. Save one in the app's Settings tab, or set LEAGUE_ID in .env.")
         return 1
     if not (swid and espn_s2):
         print("WARNING: SWID / ESPN_S2 not set. Private leagues will 401.\n")

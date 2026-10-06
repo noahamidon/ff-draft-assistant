@@ -17,6 +17,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+from draftkit import profiles
 from draftkit.config import LeagueConfig
 from draftkit.draft_state import DraftState
 from draftkit.projections import load_projections
@@ -168,17 +169,80 @@ def load_config() -> LeagueConfig:
 
 
 @st.cache_data(show_spinner=False)
-def load_players(path: str, _cfg_key: str, ppr: float) -> pd.DataFrame:
-    cfg = st.session_state.get("config")
-    return load_projections(path, cfg)
+def load_players(path: str, cfg_key: str, _cfg: LeagueConfig, mtime: float) -> pd.DataFrame:
+    return load_projections(path, _cfg)
+
+
+def cfg_signature(c: LeagueConfig) -> str:
+    return f"{c.summary()}|{sorted(c.scoring.items())}|{c.keeper_rounds}"
 
 
 # --------------------------------------------------------------------------
-# Credentials (entered in the Settings tab, held only in memory this session)
+# Credentials: saved league profiles (config/leagues.local.json, gitignored)
+# loaded into the session; .env is the fallback.
 # --------------------------------------------------------------------------
+CRED_KEYS = {"LEAGUE_ID": "league_id", "SEASON": "season", "SWID": "swid", "ESPN_S2": "espn_s2"}
+# session keys that belong to one league and must be cleared when switching
+_LEAGUE_KEYS = ("state", "rosters", "keeper_result", "snapshot", "snapshot_error",
+                "my_team_id", "pick_order", "team_names", "apply_my_keepers",
+                "my_keepers_sel", "trade_partner", "trade_give", "trade_get", "_trade_loaded",
+                "trade_load", "ss_opp")
+
+
 def get_cred(key: str, default: str = "") -> str:
-    """Credential value: session (Settings tab) first, then .env, then default."""
+    """Credential value: session (Settings tab / saved league) first, then .env."""
     return st.session_state.get(f"cred_{key}") or os.environ.get(key, default)
+
+
+def reset_league_state() -> None:
+    for k in list(st.session_state.keys()):
+        if k in _LEAGUE_KEYS or str(k).startswith("keep_team_"):
+            del st.session_state[k]
+
+
+def connect(profile: dict, save_as: str = "") -> None:
+    """Connect to a league (raises on failure). Optionally save it as a profile."""
+    from draftkit.season import build_snapshot
+    reset_league_state()
+    for env_key, pkey in CRED_KEYS.items():
+        st.session_state[f"cred_{env_key}"] = str(profile.get(pkey) or "").strip()
+    if not st.session_state["cred_SEASON"]:
+        st.session_state["cred_SEASON"] = "2026"
+    client = espn_client()
+    raw = client.raw_settings()
+    new_cfg = LeagueConfig.from_espn_settings(raw)
+    st.session_state.config = new_cfg
+    order = list(raw.get("settings", {}).get("draftSettings", {}).get("pickOrder", []))
+    st.session_state.pick_order = order
+    st.session_state.team_names = client.teams()
+    tid = profile.get("team_id") or client.my_team_id()
+    st.session_state.my_team_id = int(tid) if tid else None
+    if tid and int(tid) in order:
+        # applied before the seat widget renders on the next run
+        st.session_state._pending_my_slot = order.index(int(tid)) + 1
+    st.session_state.connected = True
+    st.session_state.active_league = save_as or profile.get("name") or f"League {profile.get('league_id')}"
+    if save_as:
+        prof = {k: st.session_state[f"cred_{e}"] for e, k in CRED_KEYS.items()}
+        prof["team_id"] = st.session_state.my_team_id
+        profiles.upsert(save_as, prof)
+    try:
+        st.session_state.snapshot = build_snapshot(client)
+    except Exception as exc:  # noqa: BLE001 -- draft tools still work
+        st.session_state.snapshot = None
+        st.session_state.snapshot_error = str(exc)
+
+
+def refresh_snapshot() -> None:
+    from draftkit.season import build_snapshot
+    try:
+        snap = build_snapshot(espn_client())
+        if st.session_state.get("my_team_id") and snap.my_team_id is None:
+            snap.my_team_id = st.session_state.my_team_id
+        st.session_state.snapshot = snap
+        st.session_state.pop("snapshot_error", None)
+    except Exception as exc:  # noqa: BLE001
+        st.session_state.snapshot_error = str(exc)
 
 
 def is_connected() -> bool:
@@ -204,6 +268,18 @@ if "config" not in st.session_state:
 
 cfg: LeagueConfig = st.session_state.config
 
+if not st.session_state.get("_autoconnect_tried"):
+    st.session_state._autoconnect_tried = True
+    _prof = profiles.active_profile()
+    if _prof and _prof.get("league_id") and _prof.get("swid") and _prof.get("espn_s2"):
+        try:
+            with st.spinner(f"Connecting to {_prof['name']}..."):
+                connect(_prof)
+        except Exception as exc:  # noqa: BLE001
+            st.session_state.connected = False
+            st.session_state.autoconnect_error = f"{_prof['name']}: {exc}"
+    cfg = st.session_state.config
+
 if "pick_order" not in st.session_state:
     st.session_state.pick_order = []
 if "team_names" not in st.session_state:
@@ -223,7 +299,49 @@ def seat_name(seat: int) -> str:
 # Sidebar
 # --------------------------------------------------------------------------
 st.sidebar.header("League")
-st.sidebar.code(cfg.summary(), language=None)
+_saved = profiles.load()
+if _saved["leagues"]:
+    _names = list(_saved["leagues"])
+    _cur = st.session_state.get("active_league")
+    _choice = st.sidebar.selectbox(
+        "Saved leagues", _names,
+        index=_names.index(_cur) if _cur in _names else 0,
+        key=f"league_switch_{_cur}",
+    )
+    if _choice != _cur and st.sidebar.button(f"Switch to {_choice}", type="primary"):
+        try:
+            with st.spinner(f"Connecting to {_choice}..."):
+                connect(dict(_saved["leagues"][_choice], name=_choice))
+            profiles.set_active(_choice)
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.sidebar.error(f"Couldn't connect to {_choice}: {exc}")
+
+snap = st.session_state.get("snapshot")
+if snap is not None and snap.teams:
+    _tids = sorted(snap.teams)
+    _mine = st.session_state.get("my_team_id") or snap.my_team_id
+    _sel = st.sidebar.selectbox(
+        "Your team", _tids, index=_tids.index(_mine) if _mine in _tids else 0,
+        format_func=snap.team_name,
+        help="Auto-detected from your SWID when you own a team in this league.",
+    )
+    if _sel != _mine:
+        st.session_state.my_team_id = int(_sel)
+        _al = st.session_state.get("active_league")
+        if _al in _saved["leagues"]:
+            profiles.upsert(_al, dict(_saved["leagues"][_al], team_id=int(_sel)), make_active=False)
+    snap.my_team_id = int(_sel)
+    if st.sidebar.button("Refresh league data", help="Re-pull rosters, projections, waivers."):
+        with st.spinner("Refreshing from ESPN..."):
+            refresh_snapshot()
+        st.rerun()
+    st.sidebar.caption(f"Week {snap.week} · updated "
+                       f"{pd.Timestamp(snap.fetched_at, unit='s').tz_localize('UTC').tz_convert('America/New_York'):%a %-I:%M %p}")
+my_tid = snap.my_team_id if snap is not None else None
+
+with st.sidebar.expander("League rules"):
+    st.code(cfg.summary(), language=None)
 
 st.sidebar.header("Projections")
 proj_source = st.sidebar.radio(
@@ -248,15 +366,16 @@ if proj_source == "ESPN (pull live)":
                     st.sidebar.error("ESPN returned no players. Tell me and I'll adjust.")
                 else:
                     dfp.to_csv(os.path.join(DATA_DIR, "projections.csv"), index=False)
-                    load_players.clear()
                     st.sidebar.success(f"Pulled {len(dfp)} players. Saved to projections.csv.")
                     st.rerun()
             except Exception as exc:  # noqa: BLE001
                 st.sidebar.error(f"Pull failed: {exc}")
 
+if "_pending_my_slot" in st.session_state:
+    st.session_state.my_slot = st.session_state.pop("_pending_my_slot")
+st.session_state.my_slot = min(max(int(st.session_state.get("my_slot", 1)), 1), cfg.team_count)
 my_seat = st.sidebar.number_input(
-    "Your draft seat", min_value=1, max_value=cfg.team_count,
-    value=int(st.session_state.get("my_slot", 12)), step=1,
+    "Your draft seat", min_value=1, max_value=cfg.team_count, step=1, key="my_slot",
 )
 
 st.sidebar.header("Simulation")
@@ -281,13 +400,15 @@ if st.sidebar.button("Reset draft"):
 
 # players
 try:
-    players = load_players(proj_path, str(id(cfg)), cfg.ppr)
+    players = load_players(proj_path, cfg_signature(cfg), cfg,
+                           os.path.getmtime(proj_path) if os.path.exists(proj_path) else 0.0)
 except Exception as exc:  # noqa: BLE001
     st.error(f"Could not load projections from {proj_path}: {exc}")
     st.stop()
 
-# draft state
-if "state" not in st.session_state or st.session_state.state.my_team != my_seat:
+# draft state -- rebuilt when the league changes; changing your seat keeps
+# picks and keepers (they're recorded by seat, not by "you")
+if "state" not in st.session_state or st.session_state.state.config is not cfg:
     st.session_state.state = DraftState(config=cfg, my_team=int(my_seat))
 state: DraftState = st.session_state.state
 state.my_team = int(my_seat)
@@ -312,8 +433,9 @@ def cached_sim(sig: str, _state, _players, _cfg, n_sims: int, n_cands: int):
 def sim_signature() -> str:
     from draftkit.recommender import suppressed_positions
     drafted = ",".join(sorted(state.drafted_ids))
+    reserved = ",".join(sorted(f"{p.overall}:{p.player_id}" for p in state.reserved_picks))
     supp = ",".join(sorted(suppressed_positions(state, cfg)))
-    return f"{drafted}|{state.my_team}|{n_sims}|{n_cands}|{len(players)}|{round(float(players['proj'].sum()),1)}|{supp}"
+    return f"{cfg_signature(cfg)}|{drafted}|{reserved}|{state.my_team}|{n_sims}|{n_cands}|{len(players)}|{round(float(players['proj'].sum()),1)}|{supp}"
 
 # --------------------------------------------------------------------------
 # Hero + tabs
@@ -328,9 +450,29 @@ if not is_connected():
         "names load. Until then you're seeing placeholder settings."
     )
 
-tab_draft, tab_keepers, tab_league, tab_settings = st.tabs(
-    ["Draft board", "Keepers", "League & rosters", "Settings"]
+if st.session_state.get("autoconnect_error") and not is_connected():
+    st.error(f"Couldn't reconnect to your saved league — {st.session_state.autoconnect_error}. "
+             f"Cookies may have expired; update them in Settings.")
+if st.session_state.get("snapshot_error"):
+    st.warning(f"League connected, but in-season data didn't load: "
+               f"{st.session_state.snapshot_error}. Try **Refresh league data** in the sidebar.")
+
+(tab_lineup, tab_waivers, tab_trades, tab_outlook,
+ tab_draft, tab_keepers, tab_league, tab_settings) = st.tabs(
+    ["Start / Sit", "Waivers", "Trades", "Outlook",
+     "Draft board", "Keepers", "League & rosters", "Settings"]
 )
+
+import season_ui  # noqa: E402
+
+with tab_lineup:
+    season_ui.render_start_sit(snap, my_tid)
+with tab_waivers:
+    season_ui.render_waivers(snap, my_tid)
+with tab_trades:
+    season_ui.render_trades(snap, my_tid)
+with tab_outlook:
+    season_ui.render_outlook(snap, my_tid)
 
 # ==========================================================================
 # TAB 4 -- SETTINGS (credentials entered here, held only in memory)
@@ -338,40 +480,54 @@ tab_draft, tab_keepers, tab_league, tab_settings = st.tabs(
 with tab_settings:
     section("Connect to ESPN")
     st.markdown(
-        "Paste your league ID and cookies below. They're kept **only in memory "
-        "for this session** — nothing is written to disk or saved to the repo, "
-        "so this whole project is safe to host on GitHub. You'll re-enter them "
-        "each time you start the app."
+        "Paste your league ID and cookies below. Tick **Remember** to save the league "
+        "to `config/leagues.local.json` — a gitignored, owner-only file on this computer "
+        "— so it reconnects automatically next time. Save as many leagues as you like "
+        "and switch between them from the sidebar."
     )
     if is_connected():
         st.success(f"Connected to **{cfg.name}** "
                    f"({cfg.team_count} teams, {len(st.session_state.team_names)} names loaded).")
 
-    sc1, sc2 = st.columns(2)
-    with sc1:
-        v_league = st.text_input("League ID", value=get_cred("LEAGUE_ID", ""),
-                                 placeholder="198442399")
-        v_season = st.text_input("Season", value=get_cred("SEASON", "2026"))
-    with sc2:
-        v_swid = st.text_input("SWID cookie", value=get_cred("SWID", ""),
-                               type="password", placeholder="{XXXXXXXX-....}")
-        v_s2 = st.text_input("espn_s2 cookie", value=get_cred("ESPN_S2", ""),
-                             type="password", placeholder="long string with %2F, %3D ...")
+    saved = profiles.load()
+    edit_names = ["➕ New league"] + list(saved["leagues"])
+    active = st.session_state.get("active_league")
+    edit = st.selectbox("League to edit", edit_names,
+                        index=edit_names.index(active) if active in edit_names else 0)
+    base = saved["leagues"].get(edit, {}) if edit != "➕ New league" else {}
+    last = next(iter(saved["leagues"].values()), {})   # reuse cookies for a new league
 
-    if st.button("Connect to ESPN", type="primary"):
-        st.session_state.cred_LEAGUE_ID = v_league.strip()
-        st.session_state.cred_SEASON = v_season.strip() or "2026"
-        st.session_state.cred_SWID = v_swid.strip()
-        st.session_state.cred_ESPN_S2 = v_s2.strip()
+    def _pref(key, env_key, fallback=""):
+        return str(base.get(key) or (last.get(key) if key in ("swid", "espn_s2") else "")
+                   or os.environ.get(env_key, fallback) or "")
+
+    with st.form("connect_form"):
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            v_name = st.text_input("Name for this league",
+                                   value="" if edit == "➕ New league" else edit,
+                                   placeholder="e.g. Work league")
+            v_league = st.text_input("League ID", value=_pref("league_id", "LEAGUE_ID"),
+                                     placeholder="198442399")
+            v_season = st.text_input("Season", value=_pref("season", "SEASON", "2026"))
+        with sc2:
+            v_swid = st.text_input("SWID cookie", value=_pref("swid", "SWID"),
+                                   type="password", placeholder="{XXXXXXXX-....}")
+            v_s2 = st.text_input("espn_s2 cookie", value=_pref("espn_s2", "ESPN_S2"),
+                                 type="password", placeholder="long string with %2F, %3D ...")
+            v_remember = st.checkbox("Remember this league on this computer", value=True)
+        go = st.form_submit_button("Connect", type="primary")
+
+    if go:
+        prof = {"league_id": v_league.strip(), "season": v_season.strip() or "2026",
+                "swid": v_swid.strip(), "espn_s2": v_s2.strip(),
+                "team_id": base.get("team_id"),
+                "name": v_name.strip() or f"League {v_league.strip()}"}
         try:
-            client = espn_client()
-            raw = client.raw_settings()
-            st.session_state.config = LeagueConfig.from_espn_settings(raw)
-            st.session_state.pick_order = list(
-                raw.get("settings", {}).get("draftSettings", {}).get("pickOrder", [])
-            )
-            st.session_state.team_names = client.teams()
-            st.session_state.connected = True
+            with st.spinner("Connecting..."):
+                connect(prof, save_as=prof["name"] if v_remember else "")
+            if v_remember and edit not in ("➕ New league", prof["name"]):
+                profiles.remove(edit)                     # renamed
             st.success("Connected. Your league, draft order, and team names loaded.")
             st.rerun()
         except Exception as exc:  # noqa: BLE001
@@ -388,19 +544,25 @@ with tab_settings:
             "4. Copy the **Value** of `SWID` (keep the curly braces) and "
             "`espn_s2` (a long string), and paste them above.\n\n"
             "Your League ID is the number in your league's URL "
-            "(`.../leagueId=XXXXXXXXX`)."
+            "(`.../leagueId=XXXXXXXXX`). The same two cookies work for every "
+            "league on your ESPN account."
         )
-        st.caption("These cookies act like your ESPN login — keep them private. "
-                   "They live only in this running session and are never saved.")
+        st.caption("These cookies act like your ESPN login — keep them private. Saved "
+                   "leagues live only in config/leagues.local.json, which git ignores.")
 
     st.divider()
-    if st.button("Disconnect / clear credentials"):
-        for k in ("cred_LEAGUE_ID", "cred_SEASON", "cred_SWID", "cred_ESPN_S2"):
-            st.session_state.pop(k, None)
-        st.session_state.connected = False
-        st.session_state.team_names = {}
-        st.session_state.pick_order = []
-        st.rerun()
+    d1, d2 = st.columns(2)
+    with d1:
+        if edit != "➕ New league" and st.button(f"Forget “{edit}”"):
+            profiles.remove(edit)
+            st.rerun()
+    with d2:
+        if st.button("Disconnect"):
+            for k in ("cred_LEAGUE_ID", "cred_SEASON", "cred_SWID", "cred_ESPN_S2", "active_league"):
+                st.session_state.pop(k, None)
+            reset_league_state()
+            st.session_state.connected = False
+            st.rerun()
 
 # ==========================================================================
 # TAB 1 -- DRAFT BOARD
@@ -682,7 +844,11 @@ with tab_keepers:
 
     kc1, kc2 = st.columns([1, 2])
     with kc1:
-        my_team_id = st.number_input("Your ESPN team id", min_value=1, value=1, step=1)
+        my_team_id = st.number_input(
+            "Your ESPN team id", min_value=1, step=1,
+            value=int(st.session_state.get("my_team_id") or 1),
+            help="Auto-detected from your SWID when you connect.",
+        )
         if st.button("Load all rosters from ESPN"):
             if not is_connected():
                 st.error("Connect first in the Settings tab.")
@@ -693,7 +859,7 @@ with tab_keepers:
                     st.session_state.team_names = client.teams()
                     slot = client.my_slot(int(my_team_id))
                     if slot:
-                        st.session_state.my_slot = slot
+                        st.session_state._pending_my_slot = slot
                     st.success(f"Loaded {len(st.session_state.rosters)} rosters. "
                                + (f"Your draft slot: {slot}." if slot else ""))
                 except Exception as exc:  # noqa: BLE001
@@ -701,11 +867,8 @@ with tab_keepers:
                              f"manually below.")
 
     with kc2:
-        my_slot_val = st.number_input(
-            "Your draft slot (1 = first overall)",
-            min_value=1, max_value=cfg.team_count,
-            value=int(st.session_state.get("my_slot", 12)), step=1,
-        )
+        my_slot_val = int(my_seat)
+        st.metric("Your draft slot", my_slot_val, help="Set in the sidebar (auto-filled from ESPN).")
 
     rosters = st.session_state.rosters
     team_names = st.session_state.team_names

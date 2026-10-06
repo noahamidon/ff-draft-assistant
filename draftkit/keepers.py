@@ -88,7 +88,7 @@ def evaluate_keepers(
     config: LeagueConfig,
     my_slot: int,
     other_keeper_ids: Optional[set] = None,
-    max_keep: int = 3,
+    max_keep: Optional[int] = None,
     value_col: str = "vorp",
     candidate_ids: Optional[List[str]] = None,
     other_keeper_overalls: Optional[List[int]] = None,
@@ -105,6 +105,8 @@ def evaluate_keepers(
                             Without this we fall back to assuming a normal draft.
     my_slot               : your draft slot, 1..team_count
     """
+    if max_keep is None:
+        max_keep = int(getattr(config, "keeper_rounds", 0) or 3)
     players = add_vorp(players, config) if value_col == "vorp" and "vorp" not in players else players.copy()
     if value_col not in players:
         players = add_vorp(players, config)

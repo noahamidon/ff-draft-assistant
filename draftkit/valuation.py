@@ -47,7 +47,9 @@ def optimal_lineup_value(roster: List[dict], config: LeagueConfig) -> float:
         leftovers += [(v, pos) for v in vals[used[pos]:]]
     leftovers.sort(reverse=True)
 
-    for count, elig in config.flex_slots:
+    # Most restrictive flex first: with FLEX(RB/WR/TE) + OP(QB/RB/WR/TE), filling
+    # OP first could spend an RB there and leave FLEX empty while a QB sits.
+    for count, elig in sorted(config.flex_slots, key=lambda f: len(f[1])):
         taken = 0
         remaining: List[Tuple[float, str]] = []
         for v, pos in leftovers:

@@ -2,7 +2,8 @@
 
     python scripts/pull_espn_projections.py
 
-Uses LEAGUE_ID / SEASON / SWID / ESPN_S2 from your .env. Writes
+Uses your active saved league (or a named one as the first argument),
+falling back to LEAGUE_ID / SEASON / SWID / ESPN_S2 in .env. Writes
 data/projections.csv, already scored to your league (6-pt pass TDs, PPR, etc.).
 If the top players look wrong, tell me what you see and I'll adjust the pull.
 """
@@ -15,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 
 from draftkit.espn_client import ESPNClient
+from draftkit.profiles import cli_credentials
 
 load_dotenv()
 
@@ -22,15 +24,15 @@ OUT = os.path.join("data", "projections.csv")
 
 
 def main() -> int:
-    league_id = os.environ.get("LEAGUE_ID")
-    season = os.environ.get("SEASON", "2026")
+    creds = cli_credentials(sys.argv[1] if len(sys.argv) > 1 else None)
+    league_id, season = creds["LEAGUE_ID"], creds["SEASON"]
     if not league_id:
-        print("Set LEAGUE_ID in your .env first.")
+        print("No league found. Save one in the app's Settings tab, or set LEAGUE_ID in .env.")
         return 1
 
     client = ESPNClient(
         int(league_id), int(season),
-        swid=os.environ.get("SWID"), espn_s2=os.environ.get("ESPN_S2"),
+        swid=creds["SWID"] or None, espn_s2=creds["ESPN_S2"] or None,
     )
     print(f"Pulling ESPN projections for league {league_id}, season {season} ...")
     try:

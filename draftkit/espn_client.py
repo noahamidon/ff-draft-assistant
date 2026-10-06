@@ -12,6 +12,7 @@ from environment variables (never hard-code them, never commit them).
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Dict, List, Optional
 
@@ -50,6 +51,21 @@ def _season_projection(player: dict, season: int):
     return None
 
 
+_POS_ID = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "DST"}
+_IDP_SLOTS = {8, 9, 10, 11, 12, 13, 14, 15}
+
+
+def player_pos(player: dict) -> Optional[str]:
+    """Our position label for an ESPN player object (IDP if defense-eligible)."""
+    if set(player.get("eligibleSlots", []) or []) & _IDP_SLOTS:
+        return "IDP"
+    return _POS_ID.get(player.get("defaultPositionId"))
+
+
+def pro_team_abbrev(pro_team_id) -> str:
+    return _PRO_TEAM.get(pro_team_id, str(pro_team_id))
+
+
 class ESPNClient:
     def __init__(
         self,
@@ -75,14 +91,19 @@ class ESPNClient:
             c["espn_s2"] = self.espn_s2
         return c
 
-    def _get(self, views: List[str]) -> dict:
-        url = _READS_HOST + _V3.format(year=self.year, league_id=self.league_id)
+    def _get(self, views: List[str], extra_params: Optional[dict] = None,
+             fantasy_filter: Optional[dict] = None, url: Optional[str] = None) -> dict:
+        url = url or _READS_HOST + _V3.format(year=self.year, league_id=self.league_id)
         params = [("view", v) for v in views]
+        params += list((extra_params or {}).items())
+        headers = {"User-Agent": "Mozilla/5.0 (draftkit)"}
+        if fantasy_filter is not None:
+            headers["X-Fantasy-Filter"] = json.dumps(fantasy_filter)
         resp = requests.get(
             url,
             params=params,
             cookies=self._cookies,
-            headers={"User-Agent": "Mozilla/5.0 (draftkit)"},
+            headers=headers,
             timeout=self.timeout,
         )
         if resp.status_code == 401:
@@ -167,8 +188,6 @@ class ESPNClient:
         Position is derived from ESPN's defaultPositionId. This is what feeds
         the keeper board: auto-pull every roster, then mark keepers by hand.
         """
-        _POS = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "DST"}
-        _IDP_SLOTS = {8, 9, 10, 11, 12, 13, 14, 15}
         data = self.raw_rosters()
         out: Dict[int, List[dict]] = {}
         for team in data.get("teams", []):
@@ -178,11 +197,7 @@ class ESPNClient:
             for e in entries:
                 info = (e.get("playerPoolEntry", {}) or {}).get("player", {}) or {}
                 pid = info.get("id", e.get("playerId"))
-                elig = set(info.get("eligibleSlots", []) or [])
-                if elig & _IDP_SLOTS:
-                    pos = "IDP"
-                else:
-                    pos = _POS.get(info.get("defaultPositionId"), str(info.get("defaultPositionId")))
+                pos = player_pos(info) or str(info.get("defaultPositionId"))
                 players.append({
                     "player_id": str(pid),
                     "name": info.get("fullName", "Unknown"),
@@ -227,31 +242,13 @@ class ESPNClient:
                 },
             }
         }
-        import json as _json
-        resp = requests.get(
-            url,
-            params={"view": "kona_player_info"},
-            cookies=self._cookies,
-            headers={
-                "User-Agent": "Mozilla/5.0 (draftkit)",
-                "X-Fantasy-Filter": _json.dumps(xff),
-            },
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        data = self._get(["kona_player_info"], fantasy_filter=xff, url=url)
         entries = data.get("players", []) if isinstance(data, dict) else []
 
-        _POS = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "DST"}
-        _IDP_SLOTS = {8, 9, 10, 11, 12, 13, 14, 15}
         rows = []
         for e in entries:
             p = e.get("player", e) or {}
-            elig = set(p.get("eligibleSlots", []) or [])
-            if elig & _IDP_SLOTS:            # any individual-defense eligibility
-                pos = "IDP"
-            else:
-                pos = _POS.get(p.get("defaultPositionId"))
+            pos = player_pos(p)
             if pos is None:
                 continue
             proj = _season_projection(p, season)
@@ -272,3 +269,61 @@ class ESPNClient:
         # fill missing ADP with projection rank so the sim still runs
         df["adp"] = df["adp"].fillna(df["proj"].rank(ascending=False, method="first"))
         return df.sort_values("proj", ascending=False).reset_index(drop=True)
+
+    # -- in-season ----------------------------------------------------------
+    def _stats_filter(self, week: int) -> dict:
+        """Ask for every weekly actual so far, the season actual + projection,
+        and this week's projection (ESPN's split code 11{year}{week})."""
+        return {
+            "value": max(int(week), 1),
+            "additionalValue": [f"00{self.year}", f"10{self.year}",
+                                f"11{self.year}{int(week)}"],
+        }
+
+    def raw_league(self, scoring_period: Optional[int] = None) -> dict:
+        """Teams, rosters (with current lineup slots), schedule, settings,
+        status and members in one call."""
+        extra = {"scoringPeriodId": scoring_period} if scoring_period else None
+        return self._get(["mTeam", "mRoster", "mMatchup", "mSettings", "mStandings"], extra)
+
+    def raw_players_by_id(self, player_ids: List[int], week: int) -> dict:
+        """Player cards (weekly history + projections) for specific players."""
+        ids = [int(i) for i in player_ids if str(i).lstrip("-").isdigit()]
+        if not ids:
+            return {"players": []}
+        xff = {"players": {
+            "filterIds": {"value": ids},
+            "filterStatsForTopScoringPeriodIds": self._stats_filter(week),
+        }}
+        return self._get(["kona_playercard"], {"scoringPeriodId": week}, xff)
+
+    def raw_free_agents(self, week: int, limit: int = 200) -> dict:
+        """Free agents + players on waivers, most-owned first."""
+        xff = {"players": {
+            "filterStatus": {"value": ["FREEAGENT", "WAIVERS"]},
+            "limit": int(limit),
+            "sortPercOwned": {"sortPriority": 1, "sortAsc": False},
+            "filterStatsForTopScoringPeriodIds": self._stats_filter(week),
+        }}
+        return self._get(["kona_player_info"], {"scoringPeriodId": week}, xff)
+
+    def raw_pro_schedule(self) -> dict:
+        """NFL schedule: bye weeks and game times per pro team."""
+        url = _READS_HOST + f"/apis/v3/games/ffl/seasons/{self.year}"
+        return self._get(["proTeamSchedules_wl"], url=url)
+
+    def raw_transactions(self, scoring_period: int) -> dict:
+        xff = {"transactions": {"filterType": {"value": [
+            "FREEAGENT", "WAIVER", "WAIVER_ERROR", "TRADE_ACCEPT"]}}}
+        return self._get(["mTransactions2"], {"scoringPeriodId": scoring_period}, xff)
+
+    def my_team_id(self, raw_league: Optional[dict] = None) -> Optional[int]:
+        """The team owned by this SWID, if the cookie identifies an owner."""
+        if not self.swid:
+            return None
+        data = raw_league or self._get(["mTeam"])
+        me = self.swid.strip().lower()
+        for team in data.get("teams", []):
+            if any(str(o).strip().lower() == me for o in team.get("owners", []) or []):
+                return int(team["id"])
+        return None
