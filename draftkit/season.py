@@ -8,12 +8,31 @@ Player row (dict) fields:
     player_id, name, pos, pro_team, slot (ESPN lineupSlotId or None), elig
     (eligible slot ids), injury, status (ROSTER/FREEAGENT/WAIVERS), pct_owned,
     week_proj, week_actual, season_proj, season_pts, games_played, ppg,
-    weekly {period: pts}, rate (expected pts per game rest of season),
+    weekly {period: pts}, src (other sources' raw numbers, see sources.py),
+    mu {week: projected pts if he plays}, play {week: P(plays)},
+    rate (blended ROS pts per game), est / est_ros (per-source numbers),
     std_week (weekly scoring std), locked (game already kicked off this week)
 
+The projection model (apply_model):
+  1. Blend sources with equal weight -- ESPN, Sleeper/RotoWire (rescored to
+     your league), FantasyPros consensus (rank-matched to points) -- plus this
+     season's production, shrunk by how predictive it is at the position.
+  2. K and D/ST projections are pulled toward the position average: kicker
+     scoring has close to no week-to-week or year-to-year predictability (PFF)
+     and K/DST are the least accurate projections of any position (Fantasy
+     Football Analytics); matchup/implied totals carry *some* weekly signal
+     (4for4), so this week is shrunk less than future weeks.
+  3. Availability: P(plays) = 0 on byes/OUT/IR, 0.71 if Questionable and 0.06
+     if Doubtful (Footballguys injury index), and for future weeks a position
+     injury hazard (QB ~1.0, RB/TE ~2.8, WR ~2.0 games missed per season).
+  4. Replacement level comes from the actual waiver pool: for every position
+     and week, a realistically obtainable free agent (the 3rd best; 2nd for
+     the deep K/DST pools), less a small cost for using a roster move. An
+     empty slot -- bye, injury -- is filled at that level instead of scoring 0.
+
 Rest-of-season (ROS) value of a roster = sum over the remaining weeks of its
-best possible starting lineup that week -- this week from ESPN's weekly
-projection, future weeks from `rate` -- skipping byes and injury absences.
+best possible starting lineup that week, where any slot can always be filled
+at replacement level. So a pickup is only worth what it adds over streaming.
 """
 
 from __future__ import annotations
@@ -21,10 +40,11 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .config import LeagueConfig
 from .espn_client import player_pos, pro_team_abbrev
+from .sources import SOURCES, attach, fetch_all, rank_to_points
 from .valuation import optimal_lineup_value
 
 BENCH_SLOTS = {20, 21, 24, 25}       # bench, IR, (unused), rookie
@@ -34,13 +54,32 @@ IR_SLOT = 21
 WEEKLY_CV = {"QB": 0.40, "RB": 0.55, "WR": 0.60, "TE": 0.65,
              "K": 0.50, "DST": 0.70, "IDP": 0.60}
 _SHRINK_GAMES = 4                    # prior strength, in games, for weekly std
-_PRIOR_GAMES = 6                     # prior strength, in games, for ROS rate
 _GAME_LENGTH_MS = 3.5 * 3600 * 1000
 
-# how many upcoming weeks an injury designation keeps a player out
+# Weight on this season's points-per-game vs the projection sources is
+# games / (games + PRIOR). K/DST production is mostly noise, so it barely counts.
+PRIOR_GAMES = {"QB": 6, "RB": 6, "WR": 6, "TE": 6, "K": 30, "DST": 15, "IDP": 8}
+
+# Share of a projection's gap from the position average that we believe.
+RELIABILITY_WEEK = {"K": 0.6, "DST": 0.75}
+RELIABILITY_ROS = {"K": 0.3, "DST": 0.5}
+
+# Availability. Injury designations this week (Footballguys injury index:
+# 71% of Questionable players play, 5.9% of Doubtful).
+PLAY_PROB_WEEK = {"QUESTIONABLE": 0.71, "DOUBTFUL": 0.06, "OUT": 0.0,
+                  "INJURY_RESERVE": 0.0, "SUSPENSION": 0.0}
+# weeks an absence lasts (NFL IR is a 4-game minimum)
 _OUT_WEEKS = {"INJURY_RESERVE": 4, "OUT": 1, "SUSPENSION": 1}
-# share of a normal game expected this week under a designation
-_WEEK_FACTOR = {"DOUBTFUL": 0.25, "QUESTIONABLE": 0.9}
+# future-week injury hazard: avg games missed per 17 (FantasySquawk, 2015-25)
+MISS_RATE = {"QB": 1.0 / 17, "RB": 2.8 / 17, "WR": 2.0 / 17, "TE": 2.8 / 17,
+             "K": 0.3 / 17, "DST": 0.0, "IDP": 2.0 / 17}
+
+# Replacement level: the Nth best free agent that week, minus a cost for the
+# roster move (claims compete; K/DST pools are deep and churned freely).
+REPLACEMENT_RANK = {"K": 2, "DST": 2}
+_DEFAULT_REPL_RANK = 3
+STREAM_COST = {"K": 0.05, "DST": 0.05, "QB": 0.15}
+_DEFAULT_STREAM_COST = 0.25
 
 
 @dataclass
@@ -65,6 +104,14 @@ class Snapshot:
     my_team_id: Optional[int]
     names: Dict[str, str] = field(default_factory=dict)
     fetched_at: float = field(default_factory=time.time)
+    scoring_items: Dict[int, float] = field(default_factory=dict)
+    sources: Tuple[str, ...] = SOURCES
+    source_coverage: Dict[str, int] = field(default_factory=dict)
+    source_errors: Dict[str, str] = field(default_factory=dict)
+    replacement: Dict[str, Dict[int, float]] = field(default_factory=dict)
+
+    def all_rows(self) -> List[dict]:
+        return [r for rows in self.rosters.values() for r in rows] + list(self.free_agents)
 
     @property
     def remaining_weeks(self) -> List[int]:
@@ -215,8 +262,11 @@ def snapshot_from_raw(
     year: int,
     my_team_id: Optional[int] = None,
     now_ms: Optional[float] = None,
+    raw_sources: Optional[dict] = None,
+    sources: Iterable[str] = SOURCES,
 ) -> Snapshot:
-    """Pure parse of raw ESPN payloads -> Snapshot (no network)."""
+    """Pure parse of raw payloads -> Snapshot (no network). `raw_sources` is
+    sources.fetch_all() output; without it only ESPN is used."""
     settings = league.get("settings", {}) or {}
     status = league.get("status", {}) or {}
     cfg = LeagueConfig.from_espn_settings(league)
@@ -310,15 +360,18 @@ def snapshot_from_raw(
         games=_parse_games(pro_sched or {}),
         my_team_id=my_team_id,
     )
+    snap.scoring_items = {int(i["statId"]): float(i.get("points", 0) or 0)
+                          for i in (settings.get("scoringSettings", {}) or {}).get("scoringItems", []) or []
+                          if "statId" in i}
     now_ms = now_ms if now_ms is not None else time.time() * 1000
-    for rows in list(rosters.values()) + [fas]:
-        for r in rows:
-            enrich(r, snap, now_ms)
-            snap.names[r["player_id"]] = r["name"]
+    for r in snap.all_rows():
+        _game_state(r, snap, now_ms)
+        snap.names[r["player_id"]] = r["name"]
+    apply_model(snap, sources, raw_sources or {})
     return snap
 
 
-def build_snapshot(client, fa_limit: int = 200) -> Snapshot:
+def build_snapshot(client, fa_limit: int = 200, sources: Iterable[str] = SOURCES) -> Snapshot:
     """Fetch everything the in-season tools need from ESPN."""
     league = client.raw_league()
     week = int(league.get("scoringPeriodId") or 1)
@@ -340,78 +393,222 @@ def build_snapshot(client, fa_limit: int = 200) -> Snapshot:
         except Exception:  # noqa: BLE001
             pass
     my_tid = client.my_team_id(league)
-    return snapshot_from_raw(league, cards, fas, pro, txns, client.year, my_tid)
+    final = int((league.get("status") or {}).get("finalScoringPeriod") or 17)
+    raw_sources = fetch_all(client.year, range(week, final + 1), sources)
+    return snapshot_from_raw(league, cards, fas, pro, txns, client.year, my_tid,
+                             raw_sources=raw_sources, sources=sources)
 
 
 # --------------------------------------------------------------------------
-# Derived per-player values
+# The projection model
 # --------------------------------------------------------------------------
-def enrich(row: dict, snap: Snapshot, now_ms: float) -> None:
-    """Fill rate / std_week / locked on a parsed player row."""
-    prior = []
-    if row.get("season_proj") and row["season_proj"] > 0:
-        prior.append(row["season_proj"] / 17.0)
-    if row.get("week_proj") and row["week_proj"] > 0:
-        prior.append(row["week_proj"])
-    prior_rate = sum(prior) / len(prior) if prior else (row.get("ppg") or 0.0)
-    g = row.get("games_played", 0)
-    if g and row.get("ppg") is not None:
-        w = g / (g + _PRIOR_GAMES)
-        rate = (1 - w) * prior_rate + w * row["ppg"]
-    else:
-        rate = prior_rate
-    row["rate"] = max(float(rate), 0.0)
-
-    cv = WEEKLY_CV.get(row["pos"], 0.6)
-    prior_sd = cv * max(row["rate"], 3.0)
-    hist = list(row.get("weekly", {}).values())
-    if len(hist) >= 2:
-        m = sum(hist) / len(hist)
-        emp_var = sum((x - m) ** 2 for x in hist) / (len(hist) - 1)
-        n = len(hist)
-        var = (n * emp_var + _SHRINK_GAMES * prior_sd ** 2) / (n + _SHRINK_GAMES)
-        row["std_week"] = max(math.sqrt(var), 1.5)
-    else:
-        row["std_week"] = max(prior_sd, 1.5)
-
+def _game_state(row: dict, snap: Snapshot, now_ms: float) -> None:
     kickoff = snap.games.get(row["pro_team"], {}).get(snap.week)
     row["locked"] = bool(kickoff and kickoff <= now_ms)
     row["game_over"] = bool(kickoff and kickoff + _GAME_LENGTH_MS <= now_ms)
 
 
-def availability(row: dict, week: int, snap: Snapshot) -> float:
-    """Expected share of a normal game the player plays in `week` (0..1)."""
+def _mean(vals) -> Optional[float]:
+    vals = [v for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _sleeper_scale(rows: List[dict], snap: Snapshot) -> Dict[str, float]:
+    """Per-position factor mapping Sleeper's points onto ESPN's league-scored
+    points (catches scoring rules we couldn't map stat-by-stat)."""
+    out = {}
+    for pos in {r["pos"] for r in rows}:
+        pairs = [(r["week_proj"], r["src"]["sleeper"].get(snap.week)) for r in rows
+                 if r["pos"] == pos and r.get("week_proj") and r["src"]["sleeper"].get(snap.week)]
+        pairs = sorted(pairs, key=lambda p: -p[0])[:40]
+        if len(pairs) < 5:
+            out[pos] = 1.0
+            continue
+        e = sorted(p[0] for p in pairs)[len(pairs) // 2]
+        sl = sorted(p[1] for p in pairs)[len(pairs) // 2]
+        out[pos] = min(max(e / sl, 0.7), 1.4) if sl > 0 else 1.0
+    return out
+
+
+def _play_prob(row: dict, week: int, snap: Snapshot) -> float:
     if not snap.has_game(row["pro_team"], week):
         return 0.0
     inj = row.get("injury", "ACTIVE")
-    out_for = _OUT_WEEKS.get(inj, 0)
-    if week < snap.week + out_for:
+    if week < snap.week + _OUT_WEEKS.get(inj, 0):
         return 0.0
     if week == snap.week:
-        return _WEEK_FACTOR.get(inj, 1.0)
-    return 1.0
+        return PLAY_PROB_WEEK.get(inj, 1.0)
+    ahead = week - snap.week
+    return 1.0 - MISS_RATE.get(row["pos"], 0.1) * min(1.0, ahead / 4.0)
+
+
+def _starter_demand(snap: Snapshot, pos: str) -> int:
+    cfg = snap.config
+    n = cfg.starters.get(pos, 0) + sum(c for c, e in cfg.flex_slots if pos in e) * 0.5
+    return max(1, int(round(cfg.team_count * n)))
+
+
+def apply_model(snap: Snapshot, sources: Optional[Iterable[str]] = None,
+                raw_sources: Optional[dict] = None) -> None:
+    """(Re)compute every player's projection from the enabled sources. Cheap to
+    call again when the user toggles sources (raw numbers stay on the rows)."""
+    if sources is not None:
+        snap.sources = tuple(s for s in SOURCES if s in set(sources)) or ("espn",)
+    rows = snap.all_rows()
+    if raw_sources is not None:
+        snap.source_coverage = attach(rows, raw_sources, snap.scoring_items, snap.config.ppr)
+        snap.source_errors = dict(raw_sources.get("errors", {}))
+    for r in rows:
+        r.setdefault("src", {"sleeper": {}, "fp_week": None, "fp_ros": None})
+    use = set(snap.sources)
+    wk, weeks = snap.week, snap.remaining_weeks
+    scale = _sleeper_scale(rows, snap)
+
+    def sl(r, w):
+        v = r["src"]["sleeper"].get(w)
+        return None if v is None or "sleeper" not in use else v * scale.get(r["pos"], 1.0)
+
+    def espn_ros(r):
+        if "espn" not in use:
+            return None
+        if r.get("season_proj") and r["season_proj"] > 0:
+            return r["season_proj"] / 17.0
+        return r["week_proj"] if r.get("week_proj") else None
+
+    def sleeper_ros(r):
+        vals = [sl(r, w) for w in weeks if w > wk and snap.has_game(r["pro_team"], w)]
+        vals = [v for v in vals if v is not None]
+        return sum(vals) / len(vals) if len(vals) >= 2 else None
+
+    # 1) per-source numbers for this week and for the rest of the season
+    for r in rows:
+        r["est"] = {"ESPN": r.get("week_proj") if "espn" in use else None,
+                    "Sleeper": sl(r, wk)}
+        r["est_ros"] = {"ESPN": espn_ros(r), "Sleeper": sleeper_ros(r)}
+    if "fantasypros" in use:
+        fpw = rank_to_points(rows, "fp_week", lambda r: _mean(r["est"].values()))
+        fpr = rank_to_points(rows, "fp_ros", lambda r: _mean(r["est_ros"].values()))
+    else:
+        fpw, fpr = {}, {}
+    for r in rows:
+        r["est"]["FantasyPros"] = fpw.get(r["player_id"])
+        r["est_ros"]["FantasyPros"] = fpr.get(r["player_id"])
+
+    # 2) blend (equal weights) + this season's production
+    for r in rows:
+        src_rate = _mean(r["est_ros"].values())
+        g, ppg = r.get("games_played", 0), r.get("ppg")
+        if src_rate is None:
+            rate = ppg or 0.0
+        elif g and ppg is not None:
+            w = g / (g + PRIOR_GAMES.get(r["pos"], 6))
+            rate = (1 - w) * src_rate + w * ppg
+        else:
+            rate = src_rate
+        rate = max(float(rate), 0.0)
+        sl_avg = r["est_ros"]["Sleeper"]
+        mu = {}
+        for w in weeks:
+            if w == wk:
+                if r.get("game_over") and r.get("week_actual") is not None:
+                    mu[w] = r["week_actual"]
+                else:
+                    this = _mean(r["est"].values())
+                    mu[w] = this if this is not None else rate
+            else:
+                shape = 1.0                      # Sleeper's matchup/schedule shape
+                v = sl(r, w)
+                if v is not None and sl_avg:
+                    shape = min(max(v / sl_avg, 0.6), 1.5)
+                mu[w] = rate * shape
+        r["rate"], r["mu"] = rate, mu
+
+    # 3) shrink K / D/ST toward the position average
+    for pos, rel_ros in RELIABILITY_ROS.items():
+        prs = [r for r in rows if r["pos"] == pos]
+        if not prs:
+            continue
+        n = _starter_demand(snap, pos)
+        rel_wk = RELIABILITY_WEEK[pos]
+        bases = []
+        for w in weeks:
+            top = sorted((r["mu"][w] for r in prs if snap.has_game(r["pro_team"], w)), reverse=True)[:n]
+            if not top:
+                continue
+            base = sum(top) / len(top)
+            bases.append(base)
+            rel = rel_wk if w == wk else rel_ros
+            for r in prs:
+                if w == wk and r.get("game_over"):
+                    continue
+                r["mu"][w] = base + rel * (r["mu"][w] - base)
+        if bases:
+            b = sum(bases) / len(bases)
+            for r in prs:
+                r["rate"] = b + rel_ros * (r["rate"] - b)
+
+    # 4) availability + weekly volatility
+    for r in rows:
+        r["play"] = {w: _play_prob(r, w, snap) for w in weeks}
+        cv = WEEKLY_CV.get(r["pos"], 0.6)
+        prior_sd = cv * max(r["rate"], 3.0)
+        hist = list(r.get("weekly", {}).values())
+        if len(hist) >= 2:
+            m = sum(hist) / len(hist)
+            emp_var = sum((x - m) ** 2 for x in hist) / (len(hist) - 1)
+            n = len(hist)
+            var = (n * emp_var + _SHRINK_GAMES * prior_sd ** 2) / (n + _SHRINK_GAMES)
+            r["std_week"] = max(math.sqrt(var), 1.5)
+        else:
+            r["std_week"] = max(prior_sd, 1.5)
+
+    # 5) replacement level from the real free-agent pool
+    snap.replacement = {}
+    for pos in {r["pos"] for r in rows}:
+        fas = [r for r in snap.free_agents if r["pos"] == pos]
+        k = REPLACEMENT_RANK.get(pos, _DEFAULT_REPL_RANK)
+        cost = STREAM_COST.get(pos, _DEFAULT_STREAM_COST)
+        per = {}
+        for w in weeks:
+            vals = sorted((r["play"][w] * r["mu"][w] for r in fas), reverse=True)
+            per[w] = (vals[k - 1] if len(vals) >= k else (vals[-1] if vals else 0.0)) * (1 - cost)
+        snap.replacement[pos] = per
+
+
+def replacement(snap: Snapshot, pos: str, week: int) -> float:
+    return snap.replacement.get(pos, {}).get(week, 0.0)
+
+
+def play_prob(row: dict, week: int, snap: Snapshot) -> float:
+    return row.get("play", {}).get(week, 0.0)
 
 
 def week_mean(row: dict, week: int, snap: Snapshot) -> float:
-    """Expected fantasy points for `week`."""
-    if week == snap.week:
-        if row.get("game_over") and row.get("week_actual") is not None:
-            return row["week_actual"]
-        avail = availability(row, week, snap)
-        if avail == 0.0:
-            return 0.0
-        base = row["week_proj"] if row.get("week_proj") is not None else row["rate"]
-        return base * avail
-    return row["rate"] * availability(row, week, snap)
+    """Expected points the player himself scores in `week` (0 if he sits)."""
+    if week == snap.week and row.get("game_over") and row.get("week_actual") is not None:
+        return row["week_actual"]
+    return play_prob(row, week, snap) * row.get("mu", {}).get(week, 0.0)
+
+
+def slot_value(row: dict, week: int, snap: Snapshot) -> float:
+    """Expected points from holding this player in a lineup slot: when he
+    doesn't play, the slot is streamed at replacement level."""
+    if week == snap.week and row.get("game_over") and row.get("week_actual") is not None:
+        return row["week_actual"]
+    p = play_prob(row, week, snap)
+    return p * row.get("mu", {}).get(week, 0.0) + (1 - p) * replacement(snap, row["pos"], week)
 
 
 def week_std(row: dict, week: int, snap: Snapshot) -> float:
+    """Spread of the player's own score, including the chance he doesn't play."""
     if week == snap.week and row.get("game_over"):
         return 0.0
-    if week_mean(row, week, snap) <= 0:
+    p = play_prob(row, week, snap)
+    mu = row.get("mu", {}).get(week, 0.0)
+    if p <= 0 or mu <= 0:
         return 0.0
-    s = row["std_week"]
-    return s * 0.6 if (week == snap.week and row.get("locked")) else s
+    s = row["std_week"] * (0.6 if (week == snap.week and row.get("locked")) else 1.0)
+    return math.sqrt(p * s * s + p * (1 - p) * mu * mu)
 
 
 def ros_points(row: dict, snap: Snapshot) -> float:
@@ -423,21 +620,37 @@ def ros_points(row: dict, snap: Snapshot) -> float:
 # --------------------------------------------------------------------------
 # Roster value over the rest of the season
 # --------------------------------------------------------------------------
+def _phantom_slots(snap: Snapshot) -> Dict[str, int]:
+    """How many lineup slots each position could fill (for replacement fill-ins)."""
+    cfg = snap.config
+    out = {}
+    for pos in snap.replacement:
+        n = cfg.starters.get(pos, 0) + sum(c for c, e in cfg.flex_slots if pos in e)
+        if n:
+            out[pos] = n
+    return out
+
+
 def roster_week_values(rows: List[dict], snap: Snapshot, weeks: Optional[List[int]] = None,
                        means: Optional[Dict[Tuple[str, int], float]] = None) -> Dict[int, float]:
-    """Optimal starting-lineup points for each week. Weeks where the same set
-    of players is available share one computation (byes repeat a lot)."""
+    """Optimal starting-lineup points for each week, where every slot can also
+    be streamed at replacement level. Weeks with the same inputs share one
+    computation (byes repeat a lot)."""
     weeks = weeks if weeks is not None else snap.remaining_weeks
     cfg = snap.config
+    phantoms = _phantom_slots(snap)
     out: Dict[int, float] = {}
     cache: Dict[tuple, float] = {}
     for w in weeks:
-        vals = []
-        key = []
+        vals, key = [], []
         for r in rows:
-            m = means[(r["player_id"], w)] if means is not None else week_mean(r, w, snap)
+            m = means[(r["player_id"], w)] if means is not None else slot_value(r, w, snap)
             vals.append({"pos": r["pos"], "proj": m})
             key.append(round(m, 2))
+        for pos, n in phantoms.items():
+            rv = replacement(snap, pos, w)
+            vals += [{"pos": pos, "proj": rv}] * n
+            key.append(round(rv, 2))
         k = tuple(key)
         if k not in cache:
             cache[k] = optimal_lineup_value(vals, cfg)

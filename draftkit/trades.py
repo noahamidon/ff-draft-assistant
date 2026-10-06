@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from .season import IR_SLOT, Snapshot, roster_week_values, ros_points, week_mean
+from .season import IR_SLOT, Snapshot, roster_week_values, ros_points, slot_value, week_mean
 
 _OUTLOOK_SD = 0.30
 
@@ -41,7 +41,8 @@ class _Ctx:
     def __init__(self, snap: Snapshot, tids: Sequence[int]):
         self.snap = snap
         self.weeks = snap.remaining_weeks
-        self.means: Dict[Tuple[str, int], float] = {}
+        self.means: Dict[Tuple[str, int], float] = {}   # slot value (with stream fill-in)
+        self.own: Dict[Tuple[str, int], float] = {}     # the player's own expected points
         self.raw: Dict[str, float] = {}
         self.rows: Dict[int, List[dict]] = {}
         for tid in tids:
@@ -49,7 +50,8 @@ class _Ctx:
             self.rows[int(tid)] = rows
             for r in rows:
                 for w in self.weeks:
-                    self.means[(r["player_id"], w)] = week_mean(r, w, snap)
+                    self.means[(r["player_id"], w)] = slot_value(r, w, snap)
+                    self.own[(r["player_id"], w)] = week_mean(r, w, snap)
                 self.raw[r["player_id"]] = ros_points(r, snap)
         self.base = {tid: self.value(rows) for tid, rows in self.rows.items()}
 
@@ -113,7 +115,9 @@ def evaluate_trade(snap: Snapshot, my_tid: int, their_tid: int,
         for pid in traded:
             f = float(np.exp(rng.normal(-0.5 * _OUTLOOK_SD ** 2, _OUTLOOK_SD)))
             for w in ctx.weeks:
-                means[(pid, w)] = ctx.means[(pid, w)] * f
+                # only his own production is uncertain; the stream fill-in isn't
+                own = ctx.own[(pid, w)]
+                means[(pid, w)] = ctx.means[(pid, w)] + own * (f - 1.0)
         s = _deltas(ctx, my_tid, their_tid, give, get, means)
         my_wins += s["my_ros"] > 0
         their_wins += s["their_ros"] > 0

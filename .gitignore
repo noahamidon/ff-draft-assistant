@@ -21,3 +21,4 @@ venv/
 config/leagues.local.json
 config/leagues.local.json.tmp
 data/raw_season/
+data/cache/

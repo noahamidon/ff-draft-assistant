@@ -63,6 +63,38 @@ it under **Your team** in the sidebar.
   from simulating the remaining schedule, next to ESPN's own odds, plus each of
   your players' rest-of-season outlook and remaining byes.
 
+### How players are valued in season
+
+- **Several sources, equal weight.** Every projection averages **ESPN**,
+  **Sleeper** (RotoWire's weekly projections, rescored to your league's ESPN
+  scoring settings), and the **FantasyPros** expert consensus (weekly and
+  rest-of-season ranks, converted to points by rank-matching). Averaging
+  sources beat individual sources in 69% of head-to-head comparisons over 12
+  seasons, and equal weights did as well as tuned ones
+  ([Fantasy Football Analytics](https://fantasyfootballanalytics.net/2026/08/we-analyzed-12-seasons-of-fantasy-football-projections-heres-what-we-found.html)).
+  Toggle sources under **Projection sources** in the sidebar. For the draft,
+  pick **Consensus (pull live)** under Projections.
+- **Replacement level is the real waiver pool.** Any lineup slot can be
+  streamed at the level of a realistically available free agent (3rd best;
+  2nd for K/DST), less the cost of a roster move. Byes and injuries are filled
+  at that level instead of 0, so a pickup only counts for what it adds over
+  streaming. That fixes kickers and defenses being overvalued.
+- **K and D/ST are pulled toward the position average.** Kicker scoring has
+  close to no week-to-week or year-to-year predictability
+  ([PFF](https://www.pff.com/news/fantasy-football-metrics-that-matter-kickers)),
+  though implied team totals help a bit
+  ([4for4](https://www.4for4.com/2023/preseason/debunking-randomness-kickers-fantasy-football)),
+  so this week is shrunk less than future weeks.
+- **Availability.** Questionable players play about 71% of the time and
+  Doubtful about 6%
+  ([Footballguys](https://www.footballguys.com/article/2024-injury-index-chance-to-play-questionable-vs-doubtful)),
+  IR is 4+ weeks, and future weeks carry a per-position injury rate (QB about
+  1, RB/TE about 2.8, WR about 2.0 games missed per season,
+  [FantasySquawk](https://fantasysquawk.com/blog/injury-risk-by-position-2015-2025)).
+
+Tunable constants live at the top of `draftkit/season.py`. Source downloads
+are cached in `data/cache/` (gitignored).
+
 If something looks off against your real league, run
 `python scripts/dump_season.py` and check what ESPN returned in
 `data/raw_season/` (gitignored).
@@ -154,7 +186,8 @@ draftkit/
   draft_state.py  snake order, picks, rosters, whose turn
   recommender.py  fold every signal into one ranked board + reasoning
   profiles.py     saved league logins (config/leagues.local.json)
-  season.py       in-season snapshot: rosters, projections, byes, ROS value
+  season.py       in-season snapshot + projection model (blend, shrink, availability, replacement)
+  sources.py      Sleeper / FantasyPros fetch, id joins, league rescoring
   lineup.py       win-probability start/sit (exact slot assignment)
   waivers.py      pickups + drops, waiver order, league activity
   trades.py       trade evaluator + win-win trade search

@@ -14,7 +14,21 @@ from typing import List, Optional
 
 import pandas as pd
 
-from .season import IR_SLOT, Snapshot, roster_ros_value, ros_points, week_mean
+from .season import IR_SLOT, Snapshot, play_prob, replacement, roster_ros_value, ros_points, week_mean
+
+
+def source_summary(row: dict, key: str = "est") -> str:
+    """'ESPN / Sleeper / FantasyPros' numbers for display ('–' = no data)."""
+    est = row.get(key) or {}
+    return " / ".join("–" if est.get(k) is None else f"{est[k]:.1f}"
+                      for k in ("ESPN", "Sleeper", "FantasyPros"))
+
+
+def streaming_baseline(snap: Snapshot) -> dict:
+    """This week's replacement level per position (what you can stream)."""
+    order = ["QB", "RB", "WR", "TE", "K", "DST", "IDP"]
+    return {p: round(replacement(snap, p, snap.week), 1)
+            for p in order if p in snap.replacement and p in _started_positions(snap)}
 
 
 def rank_pickups(snap: Snapshot, my_tid: int, top: int = 25,
@@ -51,6 +65,8 @@ def rank_pickups(snap: Snapshot, my_tid: int, top: int = 25,
             "owned_%": round(fa["pct_owned"], 1),
             "inj": "" if fa["injury"] == "ACTIVE" else fa["injury"].title().replace("_", " "),
             "this_wk_proj": round(week_mean(fa, snap.week, snap), 1),
+            "plays_%": round(100 * play_prob(fa, snap.week, snap)),
+            "ESPN / Sleeper / FP": source_summary(fa),
             "ros_ppg": round(fa["rate"], 1),
             "gain_this_wk": round(wgain, 1),
             "gain_ros": round(gain, 1),

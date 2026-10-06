@@ -14,7 +14,8 @@ from draftkit.lineup import start_sit
 from draftkit.outlook import season_outlook
 from draftkit.season import IR_SLOT, Snapshot, ros_points, week_mean
 from draftkit.trades import evaluate_trade, suggest_trades
-from draftkit.waivers import rank_pickups, recent_activity, waiver_table
+from draftkit.waivers import (rank_pickups, recent_activity, source_summary,
+                              streaming_baseline, waiver_table)
 
 _POS_COLORS = {
     "QB": "#3d6e4e", "RB": "#943c3c", "WR": "#9e862f",
@@ -49,7 +50,7 @@ def _banner(label: str, value: str, sub: str, color: str = "#3d6e4e") -> None:
 
 
 def _snap_key(snap: Snapshot) -> str:
-    return f"{snap.config.name}|{snap.year}|{snap.fetched_at}|{snap.my_team_id}"
+    return f"{snap.config.name}|{snap.year}|{snap.fetched_at}|{snap.my_team_id}|{','.join(snap.sources)}"
 
 
 @st.cache_data(show_spinner=False)
@@ -119,9 +120,11 @@ def render_start_sit(snap: Snapshot, tid) -> None:
     left, right = st.columns([3, 2])
     with left:
         _section("Recommended lineup")
+        by_id = {r["player_id"]: r for r in snap.rosters.get(tid, [])}
         lu = pd.DataFrame([{
             "slot": e["slot_label"], "player": e["name"], "pos": e["pos"], "team": e["pro_team"],
             "proj": round(e["mean"], 1), "± sd": round(e["std"], 1),
+            "ESPN / Sleeper / FP": source_summary(by_id.get(e["player_id"], {})),
             "status": ("🔒 locked" if e["locked"] else "") +
                       ("" if e["injury"] == "ACTIVE" else f" {e['injury'].title().replace('_', ' ')}"),
         } for e in rec["lineup"]])
@@ -132,6 +135,7 @@ def render_start_sit(snap: Snapshot, tid) -> None:
         bdf = pd.DataFrame([{
             "player": r["name"], "pos": r["pos"], "team": r["pro_team"],
             "proj": round(week_mean(r, snap.week, snap), 1),
+            "ESPN / Sleeper / FP": source_summary(r),
             "where": "IR" if r.get("slot") == IR_SLOT else "bench",
             "inj": "" if r["injury"] == "ACTIVE" else r["injury"].title().replace("_", " "),
         } for r in bench])
@@ -153,9 +157,11 @@ def render_start_sit(snap: Snapshot, tid) -> None:
                             for e in res["opp_lineup"]])
         if not odf.empty:
             _show(odf)
-    st.caption("Projections are ESPN's weekly numbers; ± sd comes from each player's weekly "
-               "scoring history this season, shrunk toward a position norm. Players whose "
-               "games have kicked off are locked.")
+    st.caption("Projections average ESPN, Sleeper (RotoWire) and FantasyPros consensus, "
+               "then are multiplied by the chance the player suits up (Questionable ≈ 71%, "
+               "Doubtful ≈ 6%). ± sd comes from his weekly scoring this season plus that "
+               "chance of a zero. K and D/ST are pulled toward the position average — their "
+               "week-to-week scoring is mostly noise. Players whose games have kicked off are locked.")
 
 
 # --------------------------------------------------------------------------
@@ -163,9 +169,15 @@ def render_waivers(snap: Snapshot, tid) -> None:
     if _need(snap, tid):
         return
     _section("Best pickups for your roster")
-    st.caption("Ranked by rest-of-season lineup points gained (this week counted with ESPN's "
-               "weekly projection, so bye/injury fill-ins get credit), after dropping whoever "
-               "costs you least.")
+    st.caption("Ranked by rest-of-season lineup points gained over what you could stream "
+               "anyway, after dropping whoever costs you least. Byes and injuries are filled "
+               "at the streaming baseline, so a kicker or defense only scores here if he's "
+               "clearly better than the next free agent.")
+    base = streaming_baseline(snap)
+    if base:
+        st.caption("Streaming baseline this week (a realistically available free agent, "
+                   "less the cost of a roster move): "
+                   + " · ".join(f"{p} {v:.1f}" for p, v in base.items()))
     with st.spinner("Scoring free agents against your roster..."):
         pk = _pickups(_snap_key(snap), snap, int(tid))
     if pk.empty:

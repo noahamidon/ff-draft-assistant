@@ -212,6 +212,10 @@ def connect(profile: dict, save_as: str = "") -> None:
     raw = client.raw_settings()
     new_cfg = LeagueConfig.from_espn_settings(raw)
     st.session_state.config = new_cfg
+    st.session_state.scoring_items = {
+        int(i["statId"]): float(i.get("points", 0) or 0)
+        for i in raw.get("settings", {}).get("scoringSettings", {}).get("scoringItems", []) or []
+        if "statId" in i}
     order = list(raw.get("settings", {}).get("draftSettings", {}).get("pickOrder", []))
     st.session_state.pick_order = order
     st.session_state.team_names = client.teams()
@@ -332,6 +336,19 @@ if snap is not None and snap.teams:
         if _al in _saved["leagues"]:
             profiles.upsert(_al, dict(_saved["leagues"][_al], team_id=int(_sel)), make_active=False)
     snap.my_team_id = int(_sel)
+    from draftkit.season import apply_model
+    from draftkit.sources import SOURCE_LABELS, SOURCES
+    _src = st.sidebar.multiselect(
+        "Projection sources", list(SOURCES), default=list(snap.sources),
+        format_func=SOURCE_LABELS.get,
+        help="Blended with equal weight — averaging sources beats any single one.",
+    ) or ["espn"]
+    if tuple(s for s in SOURCES if s in _src) != snap.sources:
+        apply_model(snap, _src)
+    _cov = snap.source_coverage
+    st.sidebar.caption(f"Matched players — Sleeper {_cov.get('sleeper', 0)}, "
+                       f"FantasyPros {_cov.get('fantasypros', 0)}"
+                       + (f" · ⚠️ {', '.join(snap.source_errors)} unavailable" if snap.source_errors else ""))
     if st.sidebar.button("Refresh league data", help="Re-pull rosters, projections, waivers."):
         with st.spinner("Refreshing from ESPN..."):
             refresh_snapshot()
@@ -346,8 +363,9 @@ with st.sidebar.expander("League rules"):
 st.sidebar.header("Projections")
 proj_source = st.sidebar.radio(
     "Source",
-    ["CSV file", "ESPN (pull live)"],
-    help="ESPN pulls league-scored projections + ADP for free using your login.",
+    ["CSV file", "Consensus (pull live)", "ESPN (pull live)"],
+    help="Consensus averages ESPN, Sleeper (RotoWire) and FantasyPros, scored to "
+         "your league. ESPN pulls ESPN's league-scored projections + ADP only.",
 )
 
 proj_default = os.path.join(DATA_DIR, "projections.csv")
@@ -355,13 +373,19 @@ if not os.path.exists(proj_default):
     proj_default = os.path.join(DATA_DIR, "projections.sample.csv")
 proj_path = st.sidebar.text_input("Projections CSV", value=proj_default)
 
-if proj_source == "ESPN (pull live)":
-    if st.sidebar.button("Pull ESPN projections now"):
+if proj_source != "CSV file":
+    if st.sidebar.button(f"Pull {proj_source.split(' (')[0]} projections now"):
         if not is_connected():
             st.sidebar.error("Connect first in the Settings tab.")
         else:
             try:
                 dfp = espn_client().projections(limit=500)
+                if not dfp.empty and proj_source.startswith("Consensus"):
+                    from draftkit.sources import consensus_season
+                    dfp = consensus_season(dfp, int(get_cred("SEASON", "2026") or 2026),
+                                           st.session_state.get("scoring_items", {}), cfg.ppr)
+                    for src, err in dfp.attrs.get("errors", {}).items():
+                        st.sidebar.warning(f"{src} unavailable ({err}); blended the rest.")
                 if dfp.empty:
                     st.sidebar.error("ESPN returned no players. Tell me and I'll adjust.")
                 else:
