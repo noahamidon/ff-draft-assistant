@@ -522,8 +522,13 @@ with tab_settings:
     last = next(iter(saved["leagues"].values()), {})   # reuse cookies for a new league
 
     def _pref(key, env_key, fallback=""):
-        return str(base.get(key) or (last.get(key) if key in ("swid", "espn_s2") else "")
-                   or os.environ.get(env_key, fallback) or "")
+        return str(base.get(key) or os.environ.get(env_key, fallback) or "")
+
+    # Cookies are never sent back to the browser (a pre-filled password box can
+    # be read from the page). Blank = keep the saved cookie, or reuse the one
+    # from another saved league (the same cookies work for every league).
+    def _saved_cookie(key):
+        return base.get(key) or last.get(key) or os.environ.get(key.upper(), "")
 
     with st.form("connect_form"):
         sc1, sc2 = st.columns(2)
@@ -535,16 +540,19 @@ with tab_settings:
                                      placeholder="198442399")
             v_season = st.text_input("Season", value=_pref("season", "SEASON", "2026"))
         with sc2:
-            v_swid = st.text_input("SWID cookie", value=_pref("swid", "SWID"),
-                                   type="password", placeholder="{XXXXXXXX-....}")
-            v_s2 = st.text_input("espn_s2 cookie", value=_pref("espn_s2", "ESPN_S2"),
-                                 type="password", placeholder="long string with %2F, %3D ...")
+            v_swid = st.text_input("SWID cookie", type="password",
+                                   placeholder="saved — leave blank to keep" if _saved_cookie("swid")
+                                   else "{XXXXXXXX-....}")
+            v_s2 = st.text_input("espn_s2 cookie", type="password",
+                                 placeholder="saved — leave blank to keep" if _saved_cookie("espn_s2")
+                                 else "long string with %2F, %3D ...")
             v_remember = st.checkbox("Remember this league on this computer", value=True)
         go = st.form_submit_button("Connect", type="primary")
 
     if go:
         prof = {"league_id": v_league.strip(), "season": v_season.strip() or "2026",
-                "swid": v_swid.strip(), "espn_s2": v_s2.strip(),
+                "swid": v_swid.strip() or _saved_cookie("swid"),
+                "espn_s2": v_s2.strip() or _saved_cookie("espn_s2"),
                 "team_id": base.get("team_id"),
                 "name": v_name.strip() or f"League {v_league.strip()}"}
         try:
